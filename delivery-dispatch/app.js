@@ -29,6 +29,11 @@
     dragOrder: null,
     dragSourceRoute: null,
 
+    // Version tracking for async isolation
+    routeVersion: 0,
+    _computeRequestId: null,
+    _pendingRecalcIds: {},
+
     // Route colors
     routeColors: ['#3b82f6', '#22c55e', '#f59e0b', '#ef4444', '#a855f7', '#06b6d4']
   };
@@ -104,11 +109,11 @@
   function initWorker() {
     state.worker = new Worker('worker.js');
     state.worker.onmessage = function(e) {
-      const { type, payload } = e.data;
+      const { type, payload, requestId } = e.data;
       if (type === 'ROUTES_RESULT') {
-        handleRoutesResult(payload);
+        handleRoutesResult(payload, requestId);
       } else if (type === 'RECALC_RESULT') {
-        handleRecalcResult(payload);
+        handleRecalcResult(payload, requestId);
       }
     };
     state.worker.onerror = function(err) {
@@ -241,9 +246,22 @@
 
   function onCanvasWheel(e) {
     e.preventDefault();
+    const rect = state.canvas.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left;
+    const mouseY = e.clientY - rect.top;
+
+    // World-space position under cursor before zoom
+    const worldX = (mouseX - state.panX) / state.zoom;
+    const worldY = (mouseY - state.panY) / state.zoom;
+
     const factor = e.deltaY > 0 ? 0.9 : 1.1;
-    state.zoom *= factor;
-    state.zoom = Math.max(0.3, Math.min(5, state.zoom));
+    const newZoom = Math.max(0.3, Math.min(5, state.zoom * factor));
+
+    // Adjust pan so the same world point stays under the cursor
+    state.panX = mouseX - worldX * newZoom;
+    state.panY = mouseY - worldY * newZoom;
+    state.zoom = newZoom;
+
     renderCanvas();
   }
 
@@ -422,9 +440,16 @@
     const vehicleCount = parseInt(dom.vehicleCount.value);
     const strategy = dom.strategy.value;
 
+    // Increment version to invalidate any in-flight results
+    state.routeVersion++;
+    const requestId = 'compute_' + state.routeVersion;
+    state._computeRequestId = requestId;
+    state._pendingRecalcIds = {};
+
     // Send to Web Worker
     state.worker.postMessage({
       type: 'COMPUTE_ROUTES',
+      requestId: requestId,
       payload: {
         orders: state.data.orders,
         warehouses: state.data.warehouses,
@@ -437,7 +462,13 @@
     });
   }
 
-  function handleRoutesResult(result) {
+  function handleRoutesResult(result, requestId) {
+    // Discard stale results from previous computation
+    if (requestId !== state._computeRequestId) {
+      console.warn('Discarding stale ROUTES_RESULT, requestId:', requestId, 'current:', state._computeRequestId);
+      return;
+    }
+
     state.routes = result.routes;
     state.unassigned = result.unassigned;
     state.stats = result.stats;
@@ -456,11 +487,19 @@
     showToast('调度计算完成', 'success');
   }
 
-  function handleRecalcResult(result) {
+  function handleRecalcResult(result, requestId) {
+    // Discard stale recalc results
+    if (requestId && state._pendingRecalcIds[result.id] !== requestId) {
+      console.warn('Discarding stale RECALC_RESULT for route:', result.id, 'requestId:', requestId);
+      return;
+    }
+    delete state._pendingRecalcIds[result.id];
+
     // Update the specific route
     const idx = state.routes.findIndex(r => r.id === result.id);
     if (idx >= 0) {
       state.routes[idx] = result;
+      recalcGlobalStats();
       updateStatsBar();
       renderRouteList();
       renderCanvas();
@@ -630,7 +669,14 @@
 
     // Check capacity
     if (toRoute.totalWeight + order.weight > toRoute.vehicle.capacity) {
-      showToast('目标车辆容量不足! 剩余容量: ' + (toRoute.vehicle.capacity - toRoute.totalWeight) + 'kg', 'error');
+      showToast('目标车辆容量不足! 剩余容量: ' + (toRoute.vehicle.capacity - toRoute.totalWeight) + 'kg, 订单重量: ' + order.weight + 'kg', 'error');
+      return;
+    }
+
+    // Simulate the target route with the new order to validate constraints
+    const violations = validateMoveConstraints(order, toRoute);
+    if (violations.length > 0) {
+      showToast('无法移动: ' + violations.join('; '), 'error');
       return;
     }
 
@@ -650,9 +696,85 @@
     // Update UI
     updateStatsBar();
     renderRouteList();
+    renderUnassigned();
     renderCanvas();
 
     showToast(orderId + ' 已从路线 ' + (fromIndex + 1) + ' 移至路线 ' + (toIndex + 1), 'info');
+  }
+
+  function validateMoveConstraints(order, targetRoute) {
+    const violations = [];
+    const dpMap = {};
+    state.data.deliveryPoints.forEach(dp => { dpMap[dp.id] = dp; });
+    const whMap = {};
+    state.data.warehouses.forEach(wh => { whMap[wh.id] = wh; });
+
+    // Build a simulated order list with the new order appended
+    const simOrders = [...targetRoute.orders, order];
+    const warehouse = whMap[simOrders[0].warehouseId];
+    if (!warehouse) return violations;
+
+    const startTime = parseInt(dom.startTime.value) || 8;
+
+    // Simulate traversal to check time windows and driver constraints
+    let currentTime = startTime;
+    let currentPoint = warehouse;
+    let totalDist = 0;
+
+    for (const o of simOrders) {
+      const dp = dpMap[o.deliveryPointId];
+      if (!dp) continue;
+
+      const dx = (currentPoint.x || 0) - (dp.x || 0);
+      const dy = (currentPoint.y || 0) - (dp.y || 0);
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      totalDist += dist;
+
+      const travelTime = dist / targetRoute.vehicle.speed;
+      currentTime += travelTime;
+
+      if (currentTime < o.timeWindowStart) currentTime = o.timeWindowStart;
+
+      // Check time window violation for the moved order specifically
+      if (o.id === order.id && currentTime > o.timeWindowEnd) {
+        const delay = Math.round((currentTime - o.timeWindowEnd) * 60);
+        violations.push('订单 ' + o.id + ' 将延误 ' + delay + ' 分钟 (预计 ' + formatTime(currentTime) + ' 到达, 截止 ' + formatTime(o.timeWindowEnd) + ')');
+      }
+
+      currentTime += 0.25; // service time
+      currentPoint = dp;
+    }
+
+    // Return to warehouse distance
+    const retDx = (currentPoint.x || 0) - (warehouse.x || 0);
+    const retDy = (currentPoint.y || 0) - (warehouse.y || 0);
+    totalDist += Math.sqrt(retDx * retDx + retDy * retDy);
+    const returnTravelTime = Math.sqrt(retDx * retDx + retDy * retDy) / targetRoute.vehicle.speed;
+    const returnTime = currentTime + returnTravelTime;
+
+    // Driver constraint checks
+    if (targetRoute.driver) {
+      const drivingTime = totalDist / targetRoute.vehicle.speed;
+      const restStops = Math.floor(drivingTime / targetRoute.driver.restAfterHours);
+      const restTime = restStops * targetRoute.driver.restDuration;
+      const serviceTime = simOrders.length * 0.25;
+      const estimatedTime = drivingTime + restTime + serviceTime;
+
+      // Check driver max hours
+      if (estimatedTime > targetRoute.driver.maxHours) {
+        const overtime = Math.round((estimatedTime - targetRoute.driver.maxHours) * 60);
+        violations.push('司机将超时 ' + overtime + ' 分钟 (预计 ' + Math.round(estimatedTime * 100) / 100 + 'h, 上限 ' + targetRoute.driver.maxHours + 'h)');
+      }
+
+      // Check return-to-warehouse: driver must return within maxHours from start
+      const totalWithReturn = estimatedTime + returnTravelTime;
+      if (totalWithReturn > targetRoute.driver.maxHours) {
+        const lateMinutes = Math.round((totalWithReturn - targetRoute.driver.maxHours) * 60);
+        violations.push('返仓后将超出工时 ' + lateMinutes + ' 分钟');
+      }
+    }
+
+    return violations;
   }
 
   function recalcRoute(route) {
@@ -661,9 +783,15 @@
     const whMap = {};
     state.data.warehouses.forEach(wh => { whMap[wh.id] = wh; });
 
+    // Generate unique requestId for this route recalc
+    state.routeVersion++;
+    const requestId = 'recalc_' + route.id + '_' + state.routeVersion;
+    state._pendingRecalcIds[route.id] = requestId;
+
     // Send to worker for recalculation
     state.worker.postMessage({
       type: 'RECALCULATE_ROUTE',
+      requestId: requestId,
       payload: { route, dpMap, whMap }
     });
 
@@ -846,6 +974,10 @@
     state.routes = [];
     state.unassigned = [];
     state.stats = null;
+    // Invalidate any in-flight worker results
+    state.routeVersion++;
+    state._computeRequestId = null;
+    state._pendingRecalcIds = {};
     dom.routeList.innerHTML = '<div class="empty-state">数据已更新，请重新执行调度计算</div>';
     dom.unassignedSection.style.display = 'none';
     dom.statsBar.style.display = 'none';
@@ -986,6 +1118,7 @@
     }
 
     state.stats.assignedOrders = assignedCount;
+    state.stats.unassignedOrders = (state.stats.totalOrders || 0) - assignedCount;
     state.stats.totalWeight = totalWeight;
     state.stats.totalCapacity = totalCapacity;
     state.stats.avgLoadRate = totalCapacity > 0 ? Math.round((totalWeight / totalCapacity) * 100) : 0;

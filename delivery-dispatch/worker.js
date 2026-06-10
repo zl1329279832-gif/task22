@@ -2,14 +2,14 @@
 // Handles heavy computation off the main thread
 
 self.onmessage = function(e) {
-  const { type, payload } = e.data;
+  const { type, payload, requestId } = e.data;
 
   if (type === 'COMPUTE_ROUTES') {
     const result = computeRoutes(payload);
-    self.postMessage({ type: 'ROUTES_RESULT', payload: result });
+    self.postMessage({ type: 'ROUTES_RESULT', payload: result, requestId: requestId });
   } else if (type === 'RECALCULATE_ROUTE') {
     const result = recalculateSingleRoute(payload);
-    self.postMessage({ type: 'RECALC_RESULT', payload: result });
+    self.postMessage({ type: 'RECALC_RESULT', payload: result, requestId: requestId });
   }
 };
 
