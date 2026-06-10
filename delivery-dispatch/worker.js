@@ -22,6 +22,12 @@ self.onmessage = function(e) {
       type: 'RECALC_RESULT',
       payload: { routes: results, routeVersion, batch: true }
     });
+  } else if (type === 'INCREMENTAL_COMPUTE') {
+    const result = incrementalCompute(payload);
+    self.postMessage({
+      type: 'INCREMENTAL_RESULT',
+      payload: { ...result, routeVersion: payload.routeVersion }
+    });
   }
 };
 
@@ -29,7 +35,9 @@ self.onmessage = function(e) {
 // Core Route Computation
 // ========================
 
-function computeRoutes({ orders, warehouses, deliveryPoints, drivers, vehicles, vehicleCount, strategy, startTime }) {
+function computeRoutes({ orders, warehouses, deliveryPoints, drivers, vehicles, vehicleCount, objective, startTime }) {
+  objective = objective || 'shortest_distance';
+
   const dpMap = {};
   deliveryPoints.forEach(dp => { dpMap[dp.id] = dp; });
   const whMap = {};
@@ -48,24 +56,15 @@ function computeRoutes({ orders, warehouses, deliveryPoints, drivers, vehicles, 
     }
   }
 
-  // Group orders by warehouse
-  const ordersByWarehouse = {};
-  for (const order of validOrders) {
-    if (!ordersByWarehouse[order.warehouseId]) {
-      ordersByWarehouse[order.warehouseId] = [];
-    }
-    ordersByWarehouse[order.warehouseId].push(order);
-  }
-
   // Select vehicles
   const selectedVehicles = vehicles.slice(0, Math.min(vehicleCount, vehicles.length));
   const availableDrivers = drivers.slice(0, selectedVehicles.length);
 
-  // Sort orders by strategy
-  const sortedOrders = sortOrdersByStrategy(validOrders, strategy, dpMap, whMap);
+  // Sort orders by objective
+  const sortedOrders = sortOrdersByObjective(validOrders, objective, dpMap, whMap);
 
   // Build routes using heuristic
-  const routes = buildRoutes(sortedOrders, selectedVehicles, availableDrivers, dpMap, whMap, strategy, startTime);
+  const routes = buildRoutes(sortedOrders, selectedVehicles, availableDrivers, dpMap, whMap, objective, startTime);
 
   // Check for remaining unassigned
   const assignedOrderIds = new Set();
@@ -77,10 +76,11 @@ function computeRoutes({ orders, warehouses, deliveryPoints, drivers, vehicles, 
 
   for (const order of validOrders) {
     if (!assignedOrderIds.has(order.id)) {
-      unassigned.push({
-        order,
-        reasons: ['无法在现有车辆容量、时间窗或驾驶时长约束内分配']
-      });
+      const reasons = ['无法在现有车辆容量、时间窗或驾驶时长约束内分配'];
+      if (order.coldChain) {
+        reasons.push('冷链订单需优先保障，建议增加车辆或使用冷链专用车');
+      }
+      unassigned.push({ order, reasons });
     }
   }
 
@@ -89,6 +89,132 @@ function computeRoutes({ orders, warehouses, deliveryPoints, drivers, vehicles, 
 
   return { routes, unassigned, stats };
 }
+
+// ========================
+// Incremental Compute (locked routes preserved)
+// ========================
+
+function incrementalCompute(payload) {
+  const {
+    lockedRoutes, allOrders, warehouses, deliveryPoints,
+    drivers, vehicles, vehicleCount, objective, startTime,
+    dpMap, whMap
+  } = payload;
+
+  const effectiveObjective = objective || 'shortest_distance';
+
+  // 1. Collect order IDs consumed by locked routes
+  const lockedOrderIds = new Set();
+  const lockedRouteIds = new Set();
+  for (const lr of lockedRoutes) {
+    lockedRouteIds.add(lr.id);
+    for (const o of lr.orders) {
+      lockedOrderIds.add(o.id);
+    }
+  }
+
+  // 2. Validate orders (exclude locked ones from available pool)
+  const availableOrders = [];
+  const unassigned = [];
+
+  for (const order of allOrders) {
+    if (lockedOrderIds.has(order.id)) continue; // skip locked orders
+
+    const issues = validateOrder(order, dpMap, whMap, vehicles);
+    if (issues.length > 0) {
+      unassigned.push({ order, reasons: issues });
+    } else {
+      availableOrders.push(order);
+    }
+  }
+
+  // 3. Build unlocked route slots
+  const selectedVehicles = vehicles.slice(0, Math.min(vehicleCount, vehicles.length));
+  const availableDrivers = drivers.slice(0, selectedVehicles.length);
+
+  const unlockedRoutes = [];
+  for (let i = 0; i < selectedVehicles.length; i++) {
+    const routeId = 'ROUTE_' + (i + 1);
+    if (lockedRouteIds.has(routeId)) continue; // skip locked
+
+    unlockedRoutes.push({
+      id: routeId,
+      vehicle: selectedVehicles[i],
+      driver: availableDrivers[i] || null,
+      orders: [],
+      totalWeight: 0,
+      totalDistance: 0,
+      estimatedTime: 0,
+      groupingReason: []
+    });
+  }
+
+  // 4. Sort available orders and assign to unlocked routes
+  const sortedOrders = sortOrdersByObjective(availableOrders, effectiveObjective, dpMap, whMap);
+
+  // Group by warehouse
+  const ordersByWarehouse = {};
+  for (const order of sortedOrders) {
+    if (!ordersByWarehouse[order.warehouseId]) {
+      ordersByWarehouse[order.warehouseId] = [];
+    }
+    ordersByWarehouse[order.warehouseId].push(order);
+  }
+
+  for (const whId in ordersByWarehouse) {
+    const whOrders = ordersByWarehouse[whId];
+    const warehouse = whMap[whId];
+    assignWarehouseOrders(whOrders, warehouse, unlockedRoutes, dpMap, effectiveObjective);
+  }
+
+  // 5. Finalize unlocked routes
+  for (const route of unlockedRoutes) {
+    finalizeRoute(route, dpMap, whMap, startTime);
+  }
+
+  // 6. Merge: locked routes (as-is) + new unlocked routes
+  const allRoutes = [];
+  for (let i = 0; i < selectedVehicles.length; i++) {
+    const routeId = 'ROUTE_' + (i + 1);
+    if (lockedRouteIds.has(routeId)) {
+      // Find original locked route and include it
+      const locked = lockedRoutes.find(r => r.id === routeId);
+      if (locked) allRoutes.push(locked);
+    } else {
+      const unlocked = unlockedRoutes.find(r => r.id === routeId);
+      if (unlocked) allRoutes.push(unlocked);
+    }
+  }
+
+  // 7. Check for remaining unassigned
+  const assignedOrderIds = new Set();
+  for (const route of allRoutes) {
+    for (const order of route.orders) {
+      assignedOrderIds.add(order.id);
+    }
+  }
+
+  for (const order of availableOrders) {
+    if (!assignedOrderIds.has(order.id) && !lockedOrderIds.has(order.id)) {
+      const reasons = ['无法在现有车辆容量、时间窗或驾驶时长约束内分配'];
+      if (lockedRoutes.length > 0) {
+        reasons.push('部分路线已锁定，可用运力减少');
+      }
+      if (order.coldChain) {
+        reasons.push('冷链订单需优先保障');
+      }
+      unassigned.push({ order, reasons });
+    }
+  }
+
+  const stats = calculateStats(allRoutes, unassigned, allOrders.length);
+
+  return { routes: allRoutes, unassigned, stats };
+}
+
+// ========================
+// Validation
+// ========================
 
 function validateOrder(order, dpMap, whMap, vehicles) {
   const reasons = [];
@@ -126,22 +252,45 @@ function validateOrder(order, dpMap, whMap, vehicles) {
   return reasons;
 }
 
-function sortOrdersByStrategy(orders, strategy, dpMap, whMap) {
+// ========================
+// Sorting by Objective
+// ========================
+
+function sortOrdersByObjective(orders, objective, dpMap, whMap) {
   const sorted = [...orders];
 
-  switch (strategy) {
-    case 'priority_first':
+  switch (objective) {
+    case 'shortest_distance':
+      // Sort by priority first; distance handled during scoring
       sorted.sort((a, b) => a.priority - b.priority || a.timeWindowEnd - b.timeWindowEnd);
       break;
-    case 'time_window':
+
+    case 'least_overtime':
+      // Earliest deadline first to reduce violations
       sorted.sort((a, b) => a.timeWindowEnd - b.timeWindowEnd || a.priority - b.priority);
       break;
-    case 'nearest_first':
-      // Will be sorted during route building based on distance
-      sorted.sort((a, b) => a.priority - b.priority);
+
+    case 'load_balance':
+      // Heaviest first — fill vehicles evenly
+      sorted.sort((a, b) => b.weight - a.weight || a.priority - b.priority);
       break;
-    case 'balanced':
+
+    case 'driver_fairness':
+      // Priority first; fairness handled during scoring
+      sorted.sort((a, b) => a.priority - b.priority || a.timeWindowEnd - b.timeWindowEnd);
+      break;
+
+    case 'cold_chain_priority':
+      // Cold chain orders first, then by deadline
+      sorted.sort((a, b) => {
+        if (a.coldChain && !b.coldChain) return -1;
+        if (!a.coldChain && b.coldChain) return 1;
+        return a.timeWindowEnd - b.timeWindowEnd || a.priority - b.priority;
+      });
+      break;
+
     default:
+      // Fallback: balanced urgency
       sorted.sort((a, b) => {
         const urgencyA = (a.timeWindowEnd - a.timeWindowStart) / a.priority;
         const urgencyB = (b.timeWindowEnd - b.timeWindowStart) / b.priority;
@@ -153,7 +302,11 @@ function sortOrdersByStrategy(orders, strategy, dpMap, whMap) {
   return sorted;
 }
 
-function buildRoutes(orders, vehicles, drivers, dpMap, whMap, strategy, startTime) {
+// ========================
+// Route Building
+// ========================
+
+function buildRoutes(orders, vehicles, drivers, dpMap, whMap, objective, startTime) {
   const routes = [];
 
   for (let i = 0; i < vehicles.length; i++) {
@@ -185,7 +338,7 @@ function buildRoutes(orders, vehicles, drivers, dpMap, whMap, strategy, startTim
   for (const whId in ordersByWarehouse) {
     const whOrders = ordersByWarehouse[whId];
     const warehouse = whMap[whId];
-    assignWarehouseOrders(whOrders, warehouse, routes, dpMap, strategy);
+    assignWarehouseOrders(whOrders, warehouse, routes, dpMap, objective);
   }
 
   // Finalize route calculations
@@ -196,7 +349,7 @@ function buildRoutes(orders, vehicles, drivers, dpMap, whMap, strategy, startTim
   return routes;
 }
 
-function assignWarehouseOrders(orders, warehouse, routes, dpMap, strategy) {
+function assignWarehouseOrders(orders, warehouse, routes, dpMap, objective) {
   const remainingOrders = [...orders];
 
   while (remainingOrders.length > 0) {
@@ -216,7 +369,7 @@ function assignWarehouseOrders(orders, warehouse, routes, dpMap, strategy) {
         if (order.weight > route.vehicle.capacity) continue;
 
         // Calculate score
-        const score = calculateAssignmentScore(order, dp, warehouse, route, dpMap, strategy);
+        const score = calculateAssignmentScore(order, dp, warehouse, route, dpMap, objective);
 
         if (score < bestScore) {
           bestScore = score;
@@ -245,7 +398,11 @@ function assignWarehouseOrders(orders, warehouse, routes, dpMap, strategy) {
   }
 }
 
-function calculateAssignmentScore(order, dp, warehouse, route, dpMap, strategy) {
+// ========================
+// Multi-Objective Scoring
+// ========================
+
+function calculateAssignmentScore(order, dp, warehouse, route, dpMap, objective) {
   let score = 0;
 
   // Distance from last point in route (or warehouse)
@@ -254,9 +411,101 @@ function calculateAssignmentScore(order, dp, warehouse, route, dpMap, strategy) 
     : warehouse;
 
   const dist = distance(lastPoint, dp);
-  score += dist * 10;
 
-  // Time window compatibility
+  // Objective-specific scoring
+  switch (objective) {
+    case 'shortest_distance':
+      // Maximize distance weight — pure proximity optimization
+      score += dist * 15;
+      break;
+
+    case 'least_overtime':
+      // Distance matters but violations are heavily penalized
+      score += dist * 8;
+
+      // Simulate: how much would adding this order increase time window violations?
+      const travelTime = dist / route.vehicle.speed;
+      const currentRouteTime = route.orders.length > 0
+        ? estimateRouteEndTime(route, dpMap, warehouse)
+        : 0;
+      const arrivalAtNew = currentRouteTime + travelTime;
+      const violationMinutes = Math.max(0, (arrivalAtNew - order.timeWindowEnd) * 60);
+      score += violationMinutes * 5; // heavy penalty per minute of violation
+
+      // Also penalize cascading delays: if this order is late, all subsequent orders may be too
+      if (violationMinutes > 0) {
+        score += 200;
+      }
+
+      // Prefer time window overlap to minimize idle waiting
+      if (route.orders.length > 0) {
+        const lastOrder = route.orders[route.orders.length - 1];
+        const gap = order.timeWindowStart - lastOrder.timeWindowEnd;
+        if (gap > 2) score += gap * 50; // large gap means wasted time
+      }
+      break;
+
+    case 'load_balance':
+      // Distance is secondary; balance load across vehicles
+      score += dist * 10;
+
+      // Quadratic penalty: the fuller the vehicle, the more we penalize adding to it
+      const currentLoadRatio = route.totalWeight / route.vehicle.capacity;
+      const newLoadRatio = (route.totalWeight + order.weight) / route.vehicle.capacity;
+      score += (newLoadRatio * newLoadRatio - currentLoadRatio * currentLoadRatio) * 1000;
+
+      // Prefer putting heavy orders in emptier vehicles
+      if (order.weight > 500 && currentLoadRatio < 0.3) {
+        score -= 100; // bonus for filling empty vehicles with heavy orders
+      }
+      break;
+
+    case 'driver_fairness':
+      score += dist * 10;
+
+      // Penalize assigning to drivers who already have high estimated time
+      if (route.driver && route.estimatedTime > 0) {
+        const usedRatio = route.estimatedTime / route.driver.maxHours;
+        score += usedRatio * 500; // more used = more penalty
+      }
+
+      // If driver is near max hours, heavy penalty
+      if (route.driver) {
+        const projectedTime = route.estimatedTime + (dist / route.vehicle.speed) + 0.25;
+        if (projectedTime > route.driver.maxHours) {
+          score += 800;
+        } else if (projectedTime > route.driver.maxHours * 0.8) {
+          score += 300;
+        }
+      }
+      break;
+
+    case 'cold_chain_priority':
+      score += dist * 8;
+
+      // Massive bonus for cold chain orders — they MUST be assigned first
+      if (order.coldChain) {
+        score -= 2000;
+
+        // Also prefer tighter time window routes for cold chain
+        const urgency = order.timeWindowEnd - order.timeWindowStart;
+        score += urgency * 30; // tighter window = lower urgency value = better
+      }
+
+      // Non-cold-chain orders get slight penalty to push cold chain first
+      if (!order.coldChain && route.orders.some(o => o.coldChain)) {
+        score += 100; // slight penalty for mixing
+      }
+      break;
+
+    default:
+      // Fallback balanced scoring
+      score += dist * 10;
+      score += order.weight * 0.5;
+      break;
+  }
+
+  // Common: Time window compatibility (all objectives)
   if (route.orders.length > 0) {
     const lastOrder = route.orders[route.orders.length - 1];
     const timeOverlap = Math.min(order.timeWindowEnd, lastOrder.timeWindowEnd) -
@@ -268,24 +517,7 @@ function calculateAssignmentScore(order, dp, warehouse, route, dpMap, strategy) 
     }
   }
 
-  // Strategy-specific adjustments
-  switch (strategy) {
-    case 'priority_first':
-      score += order.priority * 100;
-      break;
-    case 'time_window':
-      score += order.timeWindowEnd * 50;
-      break;
-    case 'nearest_first':
-      // Distance is already the primary factor
-      break;
-    case 'balanced':
-    default:
-      score += order.weight * 0.5; // Prefer filling with heavier items first
-      break;
-  }
-
-  // Penalty for overloading risk (prefer balanced distribution)
+  // Common: Penalty for overloading risk
   const loadRate = (route.totalWeight + order.weight) / route.vehicle.capacity;
   if (loadRate > 0.9) {
     score += 200;
@@ -293,6 +525,29 @@ function calculateAssignmentScore(order, dp, warehouse, route, dpMap, strategy) 
 
   return score;
 }
+
+// Helper: estimate the time when a route would finish its current orders
+function estimateRouteEndTime(route, dpMap, warehouse) {
+  if (route.orders.length === 0) return 0;
+
+  let totalDist = 0;
+  let currentPoint = warehouse;
+  for (const order of route.orders) {
+    const d = dpMap[order.deliveryPointId];
+    if (d) {
+      totalDist += distance(currentPoint, d);
+      currentPoint = d;
+    }
+  }
+
+  const drivingTime = totalDist / route.vehicle.speed;
+  const serviceTime = route.orders.length * 0.25;
+  return drivingTime + serviceTime;
+}
+
+// ========================
+// Grouping Reasons
+// ========================
 
 function buildGroupingReason(order, dp, warehouse, route, dpMap) {
   const reasons = [];
@@ -318,6 +573,11 @@ function buildGroupingReason(order, dp, warehouse, route, dpMap) {
     }
   }
 
+  // Cold chain grouping
+  if (order.coldChain) {
+    reasons.push('冷链订单' + order.id + '需优先保障配送');
+  }
+
   // Direction from warehouse
   if (route.orders.length === 0) {
     reasons.push('从' + warehouse.name + '出发配送至' + dp.name);
@@ -326,11 +586,21 @@ function buildGroupingReason(order, dp, warehouse, route, dpMap) {
   return reasons.length > 0 ? reasons.join('; ') : null;
 }
 
+// ========================
+// Route Finalization (enhanced with ETA and violation reasons)
+// ========================
+
 function finalizeRoute(route, dpMap, whMap, startTime) {
-  if (route.orders.length === 0) return;
+  if (route.orders.length === 0) {
+    route.stopETAs = [];
+    return;
+  }
 
   const warehouse = whMap[route.orders[0].warehouseId];
-  if (!warehouse) return;
+  if (!warehouse) {
+    route.stopETAs = [];
+    return;
+  }
 
   // Calculate total distance
   let totalDist = 0;
@@ -384,28 +654,54 @@ function finalizeRoute(route, dpMap, whMap, startTime) {
     route.overtimeMinutes = 0;
   }
 
-  // Time window violations
+  // Time window violations with ETA and reasons
   route.timeWindowViolations = [];
+  route.stopETAs = [];
   const routeStartTime = startTime || 8;
   let currentTime = routeStartTime;
   currentPoint = warehouse;
 
-  for (const order of route.orders) {
+  for (let i = 0; i < route.orders.length; i++) {
+    const order = route.orders[i];
     const dp = dpMap[order.deliveryPointId];
     if (dp) {
-      const travelTime = distance(currentPoint, dp) / route.vehicle.speed;
+      const segDist = distance(currentPoint, dp);
+      const travelTime = segDist / route.vehicle.speed;
       currentTime += travelTime;
+
+      // Record ETA
+      const eta = Math.round(currentTime * 100) / 100;
+      route.stopETAs.push({ orderId: order.id, eta });
 
       if (currentTime < order.timeWindowStart) {
         currentTime = order.timeWindowStart; // Wait
       }
 
       if (currentTime > order.timeWindowEnd) {
+        // Determine violation reason
+        let reason = '';
+        if (route.driver && route.estimatedTime > route.driver.maxHours) {
+          reason = '司机工时超限导致整体延误';
+        } else if (segDist > 100) {
+          reason = '与前一站距离较远(' + Math.round(segDist) + ')，行驶耗时过长';
+        } else if (i > 0 && route.stopETAs.length > 1) {
+          const prevEta = route.stopETAs[route.stopETAs.length - 2].eta;
+          const waitTime = currentTime - travelTime - prevEta - 0.25;
+          if (waitTime > 0.5) {
+            reason = '前序站点等待时间窗开启耗时' + Math.round(waitTime * 60) + '分钟';
+          } else {
+            reason = '前序站点服务耗时累积，到达时间推迟';
+          }
+        } else {
+          reason = '前序站点服务耗时累积';
+        }
+
         route.timeWindowViolations.push({
           orderId: order.id,
-          expectedArrival: Math.round(currentTime * 100) / 100,
+          expectedArrival: eta,
           windowEnd: order.timeWindowEnd,
-          delay: Math.round((currentTime - order.timeWindowEnd) * 60)
+          delay: Math.round((currentTime - order.timeWindowEnd) * 60),
+          reason
         });
       }
 

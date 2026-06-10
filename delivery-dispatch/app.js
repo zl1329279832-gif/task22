@@ -15,6 +15,10 @@
     worker: null,        // Web Worker reference
     selectedRoute: null, // highlighted route index
 
+    // Multi-objective & locking
+    objective: 'shortest_distance',
+    lockedRoutes: new Set(),
+
     // Canvas state
     canvas: null,
     ctx: null,
@@ -38,7 +42,11 @@
     // Version tracking for async isolation
     routeVersion: 0,
     computeRequestId: 0,
-    pendingRecalcVersions: new Set()
+    pendingRecalcVersions: new Set(),
+
+    // Animation state for violation pulse
+    pulsePhase: 0,
+    animFrameId: null
   };
 
   // ===== DOM References =====
@@ -57,6 +65,8 @@
     dom.vehicleCount = document.getElementById('vehicleCount');
     dom.vehicleCountLabel = document.getElementById('vehicleCountLabel');
     dom.strategy = document.getElementById('strategy');
+    dom.objective = document.getElementById('objective');
+    dom.btnRecalcLocked = document.getElementById('btnRecalcLocked');
     dom.startTime = document.getElementById('startTime');
     dom.canvasInfo = document.getElementById('canvasInfo');
     dom.statsBar = document.getElementById('statsBar');
@@ -117,6 +127,8 @@
         handleRoutesResult(payload);
       } else if (type === 'RECALC_RESULT') {
         handleRecalcResult(payload);
+      } else if (type === 'INCREMENTAL_RESULT') {
+        handleIncrementalResult(payload);
       }
     };
     state.worker.onerror = function(err) {
@@ -186,8 +198,27 @@
       dom.vehicleCountLabel.textContent = this.value;
     });
 
+    // Vehicle count change — auto-recompute if routes exist and no locks
+    dom.vehicleCount.addEventListener('change', function() {
+      if (state.routes.length > 0) {
+        if (state.lockedRoutes.size > 0) {
+          showToast('请先解锁所有路线后再调整车辆数', 'warning');
+        } else {
+          startComputation();
+        }
+      }
+    });
+
+    // Objective selector
+    dom.objective.addEventListener('change', function() {
+      state.objective = this.value;
+    });
+
     // Compute button
     dom.btnCompute.addEventListener('click', startComputation);
+
+    // Recalc with locked routes
+    dom.btnRecalcLocked.addEventListener('click', recalculateWithLocks);
 
     // Import/Export
     dom.btnImport.addEventListener('click', () => { dom.importModal.style.display = 'flex'; });
@@ -443,6 +474,22 @@
   }
 
   function drawDeliveryPoints(ctx) {
+    // Build violation and cold chain lookup
+    const violationDpIds = new Set();
+    const coldChainDpIds = new Set();
+
+    for (const route of state.routes) {
+      if (route.timeWindowViolations) {
+        for (const v of route.timeWindowViolations) {
+          const order = route.orders.find(o => o.id === v.orderId);
+          if (order) violationDpIds.add(order.deliveryPointId);
+        }
+      }
+      for (const order of route.orders) {
+        if (order.coldChain) coldChainDpIds.add(order.deliveryPointId);
+      }
+    }
+
     for (const dp of state.data.deliveryPoints) {
       // Check if this point is part of a route
       let routeColor = null;
@@ -457,13 +504,35 @@
         if (routeColor) break;
       }
 
+      const isViolation = violationDpIds.has(dp.id);
+      const isColdChain = coldChainDpIds.has(dp.id);
+
+      // Violation pulse ring
+      if (isViolation) {
+        const pulseRadius = 6 + Math.sin(state.pulsePhase) * 3;
+        ctx.beginPath();
+        ctx.arc(dp.x, dp.y, pulseRadius + 4, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(239, 68, 68, ' + (0.3 + Math.sin(state.pulsePhase) * 0.2) + ')';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+
+      // Main delivery point circle
       ctx.beginPath();
       ctx.arc(dp.x, dp.y, 6, 0, Math.PI * 2);
-      ctx.fillStyle = routeColor || '#22c55e';
+      ctx.fillStyle = isViolation ? '#ef4444' : (routeColor || '#22c55e');
       ctx.fill();
-      ctx.strokeStyle = routeColor ? routeColor + '88' : '#86efac';
+      ctx.strokeStyle = isViolation ? '#fca5a5' : (routeColor ? routeColor + '88' : '#86efac');
       ctx.lineWidth = 1.5;
       ctx.stroke();
+
+      // Cold chain snowflake marker
+      if (isColdChain) {
+        ctx.fillStyle = '#06b6d4';
+        ctx.font = '10px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('\u2744', dp.x - 10, dp.y - 8);
+      }
 
       // Label
       ctx.fillStyle = '#8899aa';
@@ -489,11 +558,21 @@
 
       const isSelected = (state.selectedRoute === i);
       const isDimmed = (state.selectedRoute !== null && !isSelected);
+      const isLocked = state.lockedRoutes.has(route.id);
 
       ctx.strokeStyle = isDimmed ? color + '33' : color;
-      ctx.lineWidth = isSelected ? 3.5 : 2;
       ctx.globalAlpha = isDimmed ? 0.3 : 1;
-      ctx.setLineDash([6, 4]);
+
+      if (isLocked) {
+        // Locked routes: solid thick line
+        ctx.setLineDash([]);
+        ctx.lineWidth = isSelected ? 5 : 4;
+      } else {
+        // Unlocked routes: dashed line
+        ctx.setLineDash([6, 4]);
+        ctx.lineWidth = isSelected ? 3.5 : 2;
+      }
+
       ctx.beginPath();
       ctx.moveTo(warehouse.x, warehouse.y);
 
@@ -508,6 +587,19 @@
       ctx.lineTo(warehouse.x, warehouse.y);
       ctx.stroke();
       ctx.setLineDash([]);
+
+      // Draw lock icon at midpoint of locked routes
+      if (isLocked && route.orders.length > 0) {
+        const midIdx = Math.floor(route.orders.length / 2);
+        const midDp = dpMap[route.orders[midIdx].deliveryPointId];
+        if (midDp) {
+          ctx.fillStyle = isDimmed ? color + '44' : '#f59e0b';
+          ctx.font = '14px sans-serif';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText('\uD83D\uDD12', midDp.x, midDp.y - 18);
+        }
+      }
 
       // Draw stop numbers
       let stopNum = 1;
@@ -544,6 +636,7 @@
 
     const vehicleCount = parseInt(dom.vehicleCount.value);
     const strategy = dom.strategy.value;
+    const objective = state.objective || dom.objective.value;
     const startTime = parseInt(dom.startTime.value) || 8;
 
     // Increment computeRequestId to invalidate any in-flight recalc results
@@ -551,6 +644,10 @@
     // Bump routeVersion so any pending recalc results become stale
     state.routeVersion++;
     state.pendingRecalcVersions.clear();
+
+    // Clear locked routes on full recompute
+    state.lockedRoutes.clear();
+    updateRecalcButtonVisibility();
 
     // Send to Web Worker
     state.worker.postMessage({
@@ -563,6 +660,7 @@
         vehicles: state.data.vehicles,
         vehicleCount: vehicleCount,
         strategy: strategy,
+        objective: objective,
         startTime: startTime,
         requestId: state.computeRequestId
       }
@@ -595,6 +693,7 @@
     dom.canvasInfo.textContent = '调度完成 - ' + state.stats.activeRoutes + ' 条路线, ' +
       state.stats.assignedOrders + ' 个订单已分配';
     showToast('调度计算完成', 'success');
+    startPulseAnimation();
   }
 
   function handleRecalcResult(payload) {
@@ -633,6 +732,103 @@
     renderCanvas();
   }
 
+  // ===== Incremental Result Handler =====
+  function handleIncrementalResult(payload) {
+    // Stale result guard
+    if (payload.routeVersion !== undefined && payload.routeVersion < state.routeVersion) {
+      console.log('[Discarded] Stale INCREMENTAL_RESULT, version:', payload.routeVersion, 'current:', state.routeVersion);
+      state.pendingRecalcVersions.delete(payload.routeVersion);
+      return;
+    }
+
+    state.routes = payload.routes;
+    state.unassigned = payload.unassigned;
+    state.stats = payload.stats;
+
+    if (payload.routeVersion !== undefined) {
+      state.pendingRecalcVersions.delete(payload.routeVersion);
+    }
+
+    recalcGlobalStats();
+    updateStatsBar();
+    renderRouteList();
+    renderUnassigned();
+    renderCanvas();
+
+    dom.btnCompute.disabled = false;
+    dom.btnCompute.innerHTML = '&#9654; 开始调度计算';
+    dom.btnExport.disabled = false;
+
+    dom.canvasInfo.textContent = '锁线重算完成 - ' + state.stats.activeRoutes + ' 条路线, ' +
+      state.stats.assignedOrders + ' 个订单已分配, ' + state.lockedRoutes.size + ' 条锁定';
+    showToast('锁线重算完成', 'success');
+    startPulseAnimation();
+  }
+
+  // ===== Lock Toggle =====
+  function toggleRouteLock(routeIndex) {
+    const route = state.routes[routeIndex];
+    if (!route) return;
+
+    if (state.lockedRoutes.has(route.id)) {
+      state.lockedRoutes.delete(route.id);
+      showToast('路线 ' + (routeIndex + 1) + ' 已解锁', 'info');
+    } else {
+      state.lockedRoutes.add(route.id);
+      showToast('路线 ' + (routeIndex + 1) + ' 已锁定', 'warning');
+    }
+
+    updateRecalcButtonVisibility();
+    renderRouteList();
+    renderCanvas();
+  }
+
+  function updateRecalcButtonVisibility() {
+    dom.btnRecalcLocked.style.display = state.lockedRoutes.size > 0 ? 'block' : 'none';
+  }
+
+  // ===== Recalculate With Locks =====
+  function recalculateWithLocks() {
+    if (!state.data) {
+      showToast('请先加载数据', 'warning');
+      return;
+    }
+    if (state.lockedRoutes.size === 0) {
+      showToast('没有锁定的路线', 'warning');
+      return;
+    }
+
+    dom.btnCompute.disabled = true;
+    dom.btnCompute.innerHTML = '<span class="spinner"></span> 重算中...';
+    dom.canvasInfo.textContent = '正在锁线后增量重算...';
+
+    const lockedRoutes = state.routes.filter(r => state.lockedRoutes.has(r.id));
+    const dpMap = buildDpMap();
+    const whMap = buildWhMap();
+    const startTime = parseInt(dom.startTime.value) || 8;
+
+    state.routeVersion++;
+    state.pendingRecalcVersions.add(state.routeVersion);
+
+    state.worker.postMessage({
+      type: 'INCREMENTAL_COMPUTE',
+      payload: {
+        lockedRoutes: lockedRoutes,
+        allOrders: state.data.orders,
+        warehouses: state.data.warehouses,
+        deliveryPoints: state.data.deliveryPoints,
+        drivers: state.data.drivers,
+        vehicles: state.data.vehicles,
+        vehicleCount: parseInt(dom.vehicleCount.value),
+        objective: state.objective,
+        startTime: startTime,
+        routeVersion: state.routeVersion,
+        dpMap: dpMap,
+        whMap: whMap
+      }
+    });
+  }
+
   // ===== Stats Bar =====
   function updateStatsBar() {
     if (!state.stats) return;
@@ -658,7 +854,8 @@
 
   function createRouteCard(route, index) {
     const card = document.createElement('div');
-    card.className = 'route-card expanded';
+    const isLocked = state.lockedRoutes.has(route.id);
+    card.className = 'route-card expanded' + (isLocked ? ' locked' : '');
     card.dataset.routeIndex = index;
 
     const colorClass = 'route-color-' + ((index % 6) + 1);
@@ -670,18 +867,58 @@
       'unknown': '未知'
     }[route.overtimeRisk] || '未知';
 
+    // Capacity bar class
+    const loadRate = route.loadRate || 0;
+    const loadBarClass = loadRate > 85 ? 'high' : loadRate > 60 ? 'medium' : 'low';
+
+    // Build stop ETAs lookup
+    const etaMap = {};
+    if (route.stopETAs) {
+      for (const stop of route.stopETAs) {
+        etaMap[stop.orderId] = stop.eta;
+      }
+    }
+
+    // Build violation reason lookup
+    const violationReasonMap = {};
+    if (route.timeWindowViolations) {
+      for (const v of route.timeWindowViolations) {
+        violationReasonMap[v.orderId] = v.reason || '';
+      }
+    }
+
+    // Objective tag
+    const objectiveLabels = {
+      'shortest_distance': '最短里程',
+      'least_overtime': '最少超时',
+      'load_balance': '装载均衡',
+      'driver_fairness': '司机公平',
+      'cold_chain_priority': '冷链优先'
+    };
+
     card.innerHTML = `
       <div class="route-card-header ${colorClass}">
         <div>
-          <div class="route-title">路线 ${index + 1} - ${route.vehicle ? route.vehicle.name : 'N/A'}</div>
+          <div class="route-title">
+            路线 ${index + 1} - ${route.vehicle ? route.vehicle.name : 'N/A'}
+            ${isLocked ? '<span class="lock-badge">已锁定</span>' : ''}
+          </div>
           <div class="route-meta">${route.driver ? route.driver.name : '无司机'} | ${route.orders.length} 个订单</div>
         </div>
-        <span class="risk-badge ${riskClass}">${riskText}</span>
+        <div style="display:flex;align-items:center;gap:6px">
+          <span class="risk-badge ${riskClass}">${riskText}</span>
+          <button class="lock-btn ${isLocked ? 'locked' : ''}" data-route-index="${index}" title="${isLocked ? '解锁路线' : '锁定路线'}">
+            ${isLocked ? '&#128274;' : '&#128275;'}
+          </button>
+        </div>
       </div>
       <div class="route-card-body">
+        <div class="capacity-bar">
+          <div class="capacity-bar-fill ${loadBarClass}" style="width: ${Math.min(loadRate, 100)}%"></div>
+        </div>
         <div class="route-stats">
           <div class="route-stat"><strong>${route.totalWeight || 0}kg</strong> / ${route.vehicle ? route.vehicle.capacity : 0}kg</div>
-          <div class="route-stat">装载率 <strong>${route.loadRate || 0}%</strong></div>
+          <div class="route-stat">装载率 <strong>${loadRate}%</strong></div>
           <div class="route-stat">距离 <strong>${route.totalDistance || 0}</strong></div>
           <div class="route-stat">预计 <strong>${route.estimatedTime || 0}h</strong></div>
           <div class="route-stat">行驶 <strong>${route.drivingTime || 0}h</strong></div>
@@ -692,7 +929,10 @@
           <div class="violations">
             <h4>时间窗违规 (${route.timeWindowViolations.length})</h4>
             ${route.timeWindowViolations.map(v => `
-              <div class="violation-item">${v.orderId}: 预计 ${formatTime(v.expectedArrival)} 到达, 截止 ${formatTime(v.windowEnd)}, 延误 ${v.delay} 分钟</div>
+              <div class="violation-item">
+                ${v.orderId}: 预计 ${formatTime(v.expectedArrival)} 到达, 截止 ${formatTime(v.windowEnd)}, 延误 ${v.delay} 分钟
+                ${v.reason ? '<div class="violation-reason">' + v.reason + '</div>' : ''}
+              </div>
             `).join('')}
           </div>
         ` : ''}
@@ -714,13 +954,23 @@
         ` : ''}
 
         <ul class="order-list" data-route-index="${index}">
-          ${route.orders.map(order => createOrderItemHTML(order, index)).join('')}
+          ${route.orders.map(order => createOrderItemHTML(order, index, etaMap)).join('')}
         </ul>
       </div>
     `;
 
-    // Bind drag & drop to order items
+    // Bind lock button
     setTimeout(() => {
+      const lockBtn = card.querySelector('.lock-btn');
+      if (lockBtn) {
+        lockBtn.addEventListener('click', function(e) {
+          e.stopPropagation();
+          const idx = parseInt(this.dataset.routeIndex);
+          toggleRouteLock(idx);
+        });
+      }
+
+      // Bind drag & drop to order items
       const orderItems = card.querySelectorAll('.order-item');
       orderItems.forEach(item => {
         item.draggable = true;
@@ -737,16 +987,22 @@
     return card;
   }
 
-  function createOrderItemHTML(order, routeIndex) {
+  function createOrderItemHTML(order, routeIndex, etaMap) {
     const dp = state.data.deliveryPoints.find(d => d.id === order.deliveryPointId);
+    const isColdChain = order.coldChain || false;
+    const eta = etaMap && etaMap[order.id] !== undefined ? formatTime(etaMap[order.id]) : '';
     return `
-      <li class="order-item" data-order-id="${order.id}" data-route-index="${routeIndex}">
+      <li class="order-item${isColdChain ? ' cold-chain' : ''}" data-order-id="${order.id}" data-route-index="${routeIndex}">
         <div>
           <span class="priority-badge priority-${order.priority}"></span>
           <span class="order-id">${order.id}</span>
           <span class="order-weight">${order.weight}kg</span>
+          ${isColdChain ? '<span class="cold-chain-badge">&#10052; 冷链</span>' : ''}
         </div>
-        <span class="order-time">${formatTime(order.timeWindowStart)}-${formatTime(order.timeWindowEnd)}${dp ? ' ' + dp.name : ''}</span>
+        <span class="order-time">
+          ${formatTime(order.timeWindowStart)}-${formatTime(order.timeWindowEnd)}${dp ? ' ' + dp.name : ''}
+          ${eta ? '<span class="stop-eta">ETA ' + eta + '</span>' : ''}
+        </span>
       </li>
     `;
   }
@@ -787,10 +1043,15 @@
     const sourceRouteIndex = state.dragSourceRoute;
     const orderId = state.dragOrder;
 
-    if (sourceRouteIndex === null || sourceRouteIndex === targetRouteIndex) return;
+    if (orderId == null) return;
 
-    // Move the order
-    moveOrderBetweenRoutes(orderId, sourceRouteIndex, targetRouteIndex);
+    if (sourceRouteIndex === null) {
+      // Dragging from unassigned pool
+      assignUnassignedToRoute(orderId, targetRouteIndex);
+    } else if (sourceRouteIndex !== targetRouteIndex) {
+      // Move between routes
+      moveOrderBetweenRoutes(orderId, sourceRouteIndex, targetRouteIndex);
+    }
   }
 
   function moveOrderBetweenRoutes(orderId, fromIndex, toIndex) {
@@ -880,6 +1141,61 @@
     showToast(orderId + ' 已从路线 ' + (fromIndex + 1) + ' 移至路线 ' + (toIndex + 1), 'info');
   }
 
+  // ===== Assign from Unassigned Pool =====
+  function assignUnassignedToRoute(orderId, targetRouteIndex) {
+    const toRoute = state.routes[targetRouteIndex];
+    if (!toRoute) return;
+
+    // Find the order in unassigned
+    const unassignedIdx = state.unassigned.findIndex(u => u.order.id === orderId);
+    if (unassignedIdx < 0) return;
+
+    const order = state.unassigned[unassignedIdx].order;
+    const dpMap = buildDpMap();
+    const whMap = buildWhMap();
+    const startTime = parseInt(dom.startTime.value) || 8;
+
+    // Hard constraint: capacity
+    if (toRoute.totalWeight + order.weight > toRoute.vehicle.capacity) {
+      showToast('超载! 目标路线剩余容量: ' + (toRoute.vehicle.capacity - toRoute.totalWeight) + 'kg, 订单重量: ' + order.weight + 'kg', 'error');
+      return;
+    }
+
+    // Remove from unassigned
+    state.unassigned.splice(unassignedIdx, 1);
+
+    // Add to target route
+    toRoute.orders.push(order);
+    toRoute.totalWeight += order.weight;
+
+    // Recalc
+    state.routeVersion++;
+    state.pendingRecalcVersions.add(state.routeVersion);
+
+    localRecalcRoute(toRoute, dpMap, whMap, startTime);
+    recalcGlobalStats();
+    updateStatsBar();
+    renderRouteList();
+    renderUnassigned();
+    renderCanvas();
+
+    // If target route is NOT locked, send to worker for authoritative recalc
+    if (!state.lockedRoutes.has(toRoute.id)) {
+      state.worker.postMessage({
+        type: 'RECALCULATE_ROUTES',
+        payload: {
+          routes: [toRoute],
+          dpMap: dpMap,
+          whMap: whMap,
+          startTime: startTime,
+          routeVersion: state.routeVersion
+        }
+      });
+    }
+
+    showToast(orderId + ' 已从未分配拖入路线 ' + (targetRouteIndex + 1), 'info');
+  }
+
   function localRecalcRoute(route, dpMap, whMap, startTime) {
     if (route.orders.length === 0) {
       route.totalDistance = 0;
@@ -892,6 +1208,7 @@
       route.overtimeMinutes = 0;
       route.timeWindowViolations = [];
       route.constraintWarnings = [];
+      route.stopETAs = [];
       return;
     }
 
@@ -951,31 +1268,48 @@
       route.overtimeMinutes = 0;
     }
 
-    // --- Time window violations ---
+    // --- Time window violations with ETA and reasons ---
     const constraintWarnings = [];
     route.timeWindowViolations = [];
+    route.stopETAs = [];
     let currentTime = startTime || 8;
     currentPoint = warehouse;
 
-    for (const order of route.orders) {
+    for (let i = 0; i < route.orders.length; i++) {
+      const order = route.orders[i];
       const dp = dpMap[order.deliveryPointId];
       if (dp) {
         const ddx = (currentPoint.x || 0) - (dp.x || 0);
         const ddy = (currentPoint.y || 0) - (dp.y || 0);
-        const dist = Math.sqrt(ddx * ddx + ddy * ddy);
-        const travelTime = dist / route.vehicle.speed;
+        const segDist = Math.sqrt(ddx * ddx + ddy * ddy);
+        const travelTime = segDist / route.vehicle.speed;
         currentTime += travelTime;
+
+        // Record ETA
+        const eta = Math.round(currentTime * 100) / 100;
+        route.stopETAs.push({ orderId: order.id, eta });
 
         if (currentTime < order.timeWindowStart) {
           currentTime = order.timeWindowStart; // Wait until window opens
         }
 
         if (currentTime > order.timeWindowEnd) {
+          // Determine violation reason
+          let reason = '';
+          if (route.driver && route.estimatedTime > route.driver.maxHours) {
+            reason = '司机工时超限导致整体延误';
+          } else if (segDist > 100) {
+            reason = '与前一站距离较远(' + Math.round(segDist) + ')，行驶耗时过长';
+          } else {
+            reason = '前序站点服务耗时累积，到达时间推迟';
+          }
+
           route.timeWindowViolations.push({
             orderId: order.id,
-            expectedArrival: Math.round(currentTime * 100) / 100,
+            expectedArrival: eta,
             windowEnd: order.timeWindowEnd,
-            delay: Math.round((currentTime - order.timeWindowEnd) * 60)
+            delay: Math.round((currentTime - order.timeWindowEnd) * 60),
+            reason
           });
         }
 
@@ -1009,12 +1343,32 @@
 
     for (const item of state.unassigned) {
       const div = document.createElement('div');
-      div.className = 'unassigned-item';
+      div.className = 'unassigned-item draggable';
+      div.draggable = true;
+      div.dataset.orderId = item.order.id;
       div.innerHTML = `
         <span class="order-id">${item.order.id}</span>
         <span class="order-weight">${item.order.weight}kg</span>
+        ${item.order.coldChain ? '<span class="cold-chain-badge">&#10052; 冷链</span>' : ''}
         <div class="unassigned-reason">${item.reasons.join('<br>')}</div>
       `;
+
+      // Drag events for unassigned items
+      div.addEventListener('dragstart', function(e) {
+        state.dragOrder = item.order.id;
+        state.dragSourceRoute = null; // null = from unassigned pool
+        e.target.classList.add('dragging');
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', item.order.id);
+      });
+
+      div.addEventListener('dragend', function(e) {
+        e.target.classList.remove('dragging');
+        document.querySelectorAll('.drag-over').forEach(el => el.classList.remove('drag-over'));
+        state.dragOrder = null;
+        state.dragSourceRoute = null;
+      });
+
       dom.unassignedList.appendChild(div);
     }
   }
@@ -1104,8 +1458,11 @@
       parameters: {
         vehicleCount: parseInt(dom.vehicleCount.value),
         strategy: dom.strategy.value,
+        objective: state.objective,
         startTime: dom.startTime.value
       },
+      lockedRouteIds: Array.from(state.lockedRoutes),
+      routeVersion: state.routeVersion,
       stats: state.stats,
       routes: state.routes.map((r, i) => ({
         routeIndex: i + 1,
@@ -1149,8 +1506,10 @@
       parameters: {
         vehicleCount: parseInt(dom.vehicleCount.value),
         strategy: dom.strategy.value,
+        objective: state.objective,
         startTime: dom.startTime.value
       },
+      lockedRouteIds: Array.from(state.lockedRoutes),
       data: state.data,
       routes: state.routes,
       unassigned: state.unassigned,
@@ -1187,7 +1546,20 @@
         dom.vehicleCountLabel.textContent = saveData.parameters.vehicleCount;
         dom.strategy.value = saveData.parameters.strategy;
         dom.startTime.value = saveData.parameters.startTime;
+        if (saveData.parameters.objective) {
+          state.objective = saveData.parameters.objective;
+          dom.objective.value = saveData.parameters.objective;
+        }
       }
+
+      // Restore locked routes
+      state.lockedRoutes.clear();
+      if (saveData.lockedRouteIds && Array.isArray(saveData.lockedRouteIds)) {
+        for (const id of saveData.lockedRouteIds) {
+          state.lockedRoutes.add(id);
+        }
+      }
+      updateRecalcButtonVisibility();
 
       // Update UI
       updateOverview();
@@ -1200,12 +1572,42 @@
       const savedDate = new Date(saveData.timestamp).toLocaleString('zh-CN');
       showToast('已加载上次规划 (保存于 ' + savedDate + ')', 'success');
       dom.canvasInfo.textContent = '已加载规划 - ' + savedDate;
+      startPulseAnimation();
     } catch (err) {
       showToast('加载失败: ' + err.message, 'error');
     }
   }
 
   // ===== Utilities =====
+
+  // Pulse animation for violation nodes on canvas
+  function startPulseAnimation() {
+    // Stop any existing animation
+    if (state.animFrameId) {
+      cancelAnimationFrame(state.animFrameId);
+      state.animFrameId = null;
+    }
+
+    // Check if there are any violations to animate
+    const hasViolations = state.routes.some(r => r.timeWindowViolations && r.timeWindowViolations.length > 0);
+    if (!hasViolations) return;
+
+    function animate() {
+      state.pulsePhase += 0.08;
+      if (state.pulsePhase > Math.PI * 2) state.pulsePhase -= Math.PI * 2;
+      renderCanvas();
+      state.animFrameId = requestAnimationFrame(animate);
+    }
+    state.animFrameId = requestAnimationFrame(animate);
+  }
+
+  function stopPulseAnimation() {
+    if (state.animFrameId) {
+      cancelAnimationFrame(state.animFrameId);
+      state.animFrameId = null;
+    }
+  }
+
   function recalcGlobalStats() {
     if (!state.routes || !state.stats) return;
     let assignedCount = 0;

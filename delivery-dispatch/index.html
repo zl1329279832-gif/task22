@@ -51,6 +51,16 @@
           </select>
         </div>
         <div class="form-group">
+          <label>优化目标</label>
+          <select id="objective">
+            <option value="shortest_distance">最短里程</option>
+            <option value="least_overtime">最少超时</option>
+            <option value="load_balance">装载均衡</option>
+            <option value="driver_fairness">司机公平性</option>
+            <option value="cold_chain_priority">冷链优先</option>
+          </select>
+        </div>
+        <div class="form-group">
           <label>出发时间</label>
           <select id="startTime">
             <option value="7">07:00</option>
@@ -61,6 +71,9 @@
         </div>
         <button id="btnCompute" class="btn btn-primary btn-full">
           &#9654; 开始调度计算
+        </button>
+        <button id="btnRecalcLocked" class="btn btn-secondary btn-full" style="display:none; margin-top:8px">
+          &#128274; 锁线后重算
         </button>
       </section>
 
@@ -103,6 +116,9 @@
           <div class="legend-item"><span class="legend-dot route2"></span> 路线 2</div>
           <div class="legend-item"><span class="legend-dot route3"></span> 路线 3</div>
           <div class="legend-item"><span class="legend-dot route4"></span> 路线 4</div>
+          <div class="legend-item"><span class="legend-dot locked"></span> 已锁定路线</div>
+          <div class="legend-item"><span class="legend-dot coldchain"></span> 冷链订单</div>
+          <div class="legend-item"><span class="legend-dot violation"></span> 时间窗违约</div>
         </div>
       </section>
     </aside>

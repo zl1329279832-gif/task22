@@ -705,6 +705,146 @@ html, body {
   background: var(--text-muted);
 }
 
+/* ===== Lock Button & Locked Route ===== */
+.lock-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 16px;
+  padding: 4px 6px;
+  color: var(--text-muted);
+  transition: color 0.2s, transform 0.2s;
+  line-height: 1;
+}
+
+.lock-btn:hover {
+  transform: scale(1.2);
+}
+
+.lock-btn.locked {
+  color: var(--warning);
+}
+
+.route-card.locked {
+  border-color: var(--warning);
+}
+
+.route-card.locked .route-card-header {
+  background: rgba(245, 158, 11, 0.06);
+}
+
+.lock-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 8px;
+  font-size: 10px;
+  font-weight: 600;
+  background: rgba(245, 158, 11, 0.15);
+  color: var(--warning);
+  margin-left: 6px;
+}
+
+/* ===== Capacity Utilization Bar ===== */
+.capacity-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--bg-secondary);
+  margin: 6px 0 8px;
+  overflow: hidden;
+}
+
+.capacity-bar-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
+
+.capacity-bar-fill.low { background: var(--success); }
+.capacity-bar-fill.medium { background: var(--warning); }
+.capacity-bar-fill.high { background: var(--danger); }
+
+/* ===== Cold Chain Badge ===== */
+.cold-chain-badge {
+  display: inline-block;
+  font-size: 10px;
+  color: var(--info);
+  margin-left: 4px;
+  vertical-align: middle;
+}
+
+.order-item.cold-chain {
+  border-left: 2px solid var(--info);
+}
+
+/* ===== Stop ETA ===== */
+.stop-eta {
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-left: 4px;
+}
+
+/* ===== Violation Reason ===== */
+.violation-reason {
+  font-size: 10px;
+  color: var(--danger);
+  font-style: italic;
+  margin-top: 2px;
+}
+
+/* ===== Legend Extensions ===== */
+.legend-dot.locked {
+  background: var(--warning);
+  border: 2px solid var(--warning);
+}
+
+.legend-dot.coldchain {
+  background: var(--info);
+  border: 2px solid var(--info);
+}
+
+.legend-dot.violation {
+  background: var(--danger);
+  border: 2px solid var(--danger);
+}
+
+/* ===== Unassigned Drag ===== */
+.unassigned-item.draggable {
+  cursor: grab;
+}
+
+.unassigned-item.draggable:active {
+  cursor: grabbing;
+}
+
+.order-list.drag-over-pool {
+  border: 2px dashed var(--accent);
+  background: rgba(59, 130, 246, 0.05);
+  border-radius: var(--radius);
+}
+
+/* ===== Recalc Locked Button ===== */
+#btnRecalcLocked {
+  border-color: var(--warning);
+  color: var(--warning);
+}
+
+#btnRecalcLocked:hover {
+  background: rgba(245, 158, 11, 0.1);
+  border-color: var(--warning);
+}
+
+/* ===== Objective Label in Stats ===== */
+.objective-tag {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 8px;
+  font-size: 10px;
+  font-weight: 600;
+  background: rgba(59, 130, 246, 0.12);
+  color: var(--accent);
+  margin-left: 6px;
+}
+
 /* ===== Responsive tweaks ===== */
 @media (max-width: 1200px) {
   .panel-left { width: 240px; min-width: 240px; }
