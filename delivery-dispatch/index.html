@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>配送调度演示系统</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Top Bar -->
+  <header class="top-bar">
+    <div class="logo">
+      <span class="logo-icon">&#128666;</span>
+      <h1>配送调度演示系统</h1>
+    </div>
+    <div class="top-actions">
+      <button id="btnImport" class="btn btn-secondary" title="导入订单数据">
+        <span>&#128194;</span> 导入订单
+      </button>
+      <button id="btnExport" class="btn btn-secondary" title="导出调度方案" disabled>
+        <span>&#128190;</span> 导出方案
+      </button>
+      <button id="btnSave" class="btn btn-secondary" title="保存当前规划">
+        <span>&#128280;</span> 保存规划
+      </button>
+      <button id="btnLoad" class="btn btn-secondary" title="加载上次规划">
+        <span>&#128195;</span> 加载规划
+      </button>
+      <input type="file" id="fileInput" accept=".json" style="display:none">
+    </div>
+  </header>
+
+  <!-- Main Layout -->
+  <div class="main-layout">
+    <!-- Left Panel: Controls -->
+    <aside class="panel panel-left">
+      <section class="panel-section">
+        <h3>&#9881; 调度参数</h3>
+        <div class="form-group">
+          <label>车辆数量</label>
+          <input type="range" id="vehicleCount" min="1" max="6" value="4">
+          <span id="vehicleCountLabel">4</span> 辆
+        </div>
+        <div class="form-group">
+          <label>配送策略</label>
+          <select id="strategy">
+            <option value="balanced">均衡策略</option>
+            <option value="priority_first">优先级优先</option>
+            <option value="time_window">时间窗优先</option>
+            <option value="nearest_first">就近配送</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>出发时间</label>
+          <select id="startTime">
+            <option value="7">07:00</option>
+            <option value="8" selected>08:00</option>
+            <option value="9">09:00</option>
+            <option value="10">10:00</option>
+          </select>
+        </div>
+        <button id="btnCompute" class="btn btn-primary btn-full">
+          &#9654; 开始调度计算
+        </button>
+      </section>
+
+      <section class="panel-section">
+        <h3>&#128202; 数据概览</h3>
+        <div id="dataOverview" class="overview-grid">
+          <div class="overview-item">
+            <span class="overview-value" id="ovWarehouses">0</span>
+            <span class="overview-label">仓库</span>
+          </div>
+          <div class="overview-item">
+            <span class="overview-value" id="ovPoints">0</span>
+            <span class="overview-label">配送点</span>
+          </div>
+          <div class="overview-item">
+            <span class="overview-value" id="ovOrders">0</span>
+            <span class="overview-label">订单</span>
+          </div>
+          <div class="overview-item">
+            <span class="overview-value" id="ovDrivers">0</span>
+            <span class="overview-label">司机</span>
+          </div>
+          <div class="overview-item">
+            <span class="overview-value" id="ovVehicles">0</span>
+            <span class="overview-label">车辆</span>
+          </div>
+          <div class="overview-item">
+            <span class="overview-value" id="ovInvalid">0</span>
+            <span class="overview-label">异常订单</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel-section">
+        <h3>&#127919; 图例</h3>
+        <div class="legend">
+          <div class="legend-item"><span class="legend-dot warehouse"></span> 仓库</div>
+          <div class="legend-item"><span class="legend-dot delivery"></span> 配送点</div>
+          <div class="legend-item"><span class="legend-dot route1"></span> 路线 1</div>
+          <div class="legend-item"><span class="legend-dot route2"></span> 路线 2</div>
+          <div class="legend-item"><span class="legend-dot route3"></span> 路线 3</div>
+          <div class="legend-item"><span class="legend-dot route4"></span> 路线 4</div>
+        </div>
+      </section>
+    </aside>
+
+    <!-- Center: Canvas Map -->
+    <main class="canvas-container">
+      <canvas id="mapCanvas"></canvas>
+      <div class="canvas-overlay">
+        <span id="canvasInfo">就绪 - 加载数据后点击"开始调度计算"</span>
+      </div>
+      <div class="canvas-controls">
+        <button id="btnZoomIn" class="btn btn-small" title="放大">+</button>
+        <button id="btnZoomOut" class="btn btn-small" title="缩小">-</button>
+        <button id="btnReset" class="btn btn-small" title="重置视图">&#8634;</button>
+      </div>
+    </main>
+
+    <!-- Right Panel: Routes -->
+    <aside class="panel panel-right">
+      <section class="panel-section">
+        <h3>&#128666; 调度结果</h3>
+        <div id="statsBar" class="stats-bar" style="display:none">
+          <div class="stat-item">
+            <span class="stat-value" id="statAssigned">0</span>
+            <span class="stat-label">已分配</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-value" id="statUnassigned">0</span>
+            <span class="stat-label">未分配</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-value" id="statLoadRate">0%</span>
+            <span class="stat-label">平均装载率</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-value" id="statRisk">0</span>
+            <span class="stat-label">超时风险</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel-section route-list" id="routeList">
+        <div class="empty-state">尚未执行调度计算</div>
+      </section>
+
+      <section class="panel-section" id="unassignedSection" style="display:none">
+        <h3>&#9888; 未分配订单</h3>
+        <div id="unassignedList"></div>
+      </section>
+    </aside>
+  </div>
+
+  <!-- Modal for import -->
+  <div id="importModal" class="modal" style="display:none">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3>导入订单数据</h3>
+        <button class="modal-close" id="modalClose">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p>请选择 JSON 格式的订单数据文件，或粘贴 JSON 数据。</p>
+        <button id="btnSelectFile" class="btn btn-secondary">选择文件</button>
+        <div class="divider">或</div>
+        <textarea id="importTextarea" rows="10" placeholder='粘贴 JSON 数据，格式参考 data.json'></textarea>
+      </div>
+      <div class="modal-footer">
+        <button id="btnImportCancel" class="btn btn-secondary">取消</button>
+        <button id="btnImportConfirm" class="btn btn-primary">确认导入</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast notifications -->
+  <div id="toastContainer" class="toast-container"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
