@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>配送调度演示系统</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <!-- ====== 顶部工具栏 ====== -->
+  <header class="toolbar">
+    <div class="toolbar-left">
+      <h1>配送调度系统</h1>
+    </div>
+    <div class="toolbar-center">
+      <button id="btnLoadSample" title="加载示例数据">示例数据</button>
+      <label class="file-upload">
+        <input type="file" id="fileImport" accept=".json">
+        导入订单
+      </label>
+      <span class="sep"></span>
+      <label>车辆数
+        <select id="selVehicleCount">
+          <option value="1">1</option>
+          <option value="2">2</option>
+          <option value="3" selected>3</option>
+          <option value="4">4</option>
+          <option value="5">5</option>
+        </select>
+      </label>
+      <label>策略
+        <select id="selStrategy">
+          <option value="nearest_first">最近优先</option>
+          <option value="urgent_first">紧急优先</option>
+          <option value="cluster">区域聚类</option>
+          <option value="balanced">均衡负载</option>
+        </select>
+      </label>
+      <button id="btnPlan" class="btn-primary" disabled>开始规划</button>
+    </div>
+    <div class="toolbar-right">
+      <button id="btnUndo" disabled title="撤销上一步拖拽">撤回</button>
+      <button id="btnExport" disabled title="导出调度方案JSON">导出方案</button>
+      <button id="btnSave" disabled title="保存到浏览器">保存</button>
+      <button id="btnRestore" title="恢复上次规划">恢复</button>
+    </div>
+  </header>
+
+  <!-- ====== 主体 ====== -->
+  <main class="main-area">
+    <!-- 左侧：路线面板 -->
+    <aside class="panel panel-left" id="routePanel">
+      <h2>路线列表</h2>
+      <div id="routeList" class="route-list">
+        <p class="empty-hint">请先加载数据并规划路线</p>
+      </div>
+    </aside>
+
+    <!-- 中间：Canvas地图 -->
+    <section class="map-section">
+      <canvas id="mapCanvas"></canvas>
+      <div class="map-legend" id="mapLegend">
+        <span class="legend-item"><i class="dot dot-warehouse"></i> 仓库</span>
+        <span class="legend-item"><i class="dot dot-dp"></i> 配送点</span>
+        <span class="legend-item"><i class="dot dot-risk-ok"></i> 正常</span>
+        <span class="legend-item"><i class="dot dot-risk-tight"></i> 紧迫</span>
+        <span class="legend-item"><i class="dot dot-risk-over"></i> 超时</span>
+      </div>
+      <div class="map-tooltip" id="mapTooltip"></div>
+    </section>
+
+    <!-- 右侧：信息面板 -->
+    <aside class="panel panel-right">
+      <!-- 统计概览 -->
+      <div class="info-section" id="statsSection">
+        <h2>规划统计</h2>
+        <div id="statsContent" class="stats-grid">
+          <p class="empty-hint">暂无数据</p>
+        </div>
+      </div>
+      <!-- 数据概览 -->
+      <div class="info-section" id="dataSection">
+        <h2>数据概览</h2>
+        <div id="dataContent" class="data-overview">
+          <p class="empty-hint">未加载数据</p>
+        </div>
+      </div>
+      <!-- 未分配订单 -->
+      <div class="info-section" id="unassignedSection">
+        <h2>未分配订单 <span id="unassignedCount" class="badge">0</span></h2>
+        <div id="unassignedList" class="order-list"></div>
+      </div>
+      <!-- 异常订单 -->
+      <div class="info-section" id="invalidSection">
+        <h2>异常订单 <span id="invalidCount" class="badge badge-red">0</span></h2>
+        <div id="invalidList" class="order-list"></div>
+      </div>
+    </aside>
+  </main>
+
+  <!-- 计算中遮罩 -->
+  <div class="computing-overlay" id="computingOverlay">
+    <div class="spinner"></div>
+    <p>路线计算中...</p>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
