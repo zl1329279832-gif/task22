@@ -5,11 +5,23 @@ self.onmessage = function(e) {
   const { type, payload } = e.data;
 
   if (type === 'COMPUTE_ROUTES') {
+    const requestId = payload.requestId || 0;
     const result = computeRoutes(payload);
-    self.postMessage({ type: 'ROUTES_RESULT', payload: result });
+    self.postMessage({ type: 'ROUTES_RESULT', payload: { ...result, requestId } });
   } else if (type === 'RECALCULATE_ROUTE') {
+    // Legacy single-route recalc (kept for backward compat)
     const result = recalculateSingleRoute(payload);
     self.postMessage({ type: 'RECALC_RESULT', payload: result });
+  } else if (type === 'RECALCULATE_ROUTES') {
+    // Batch recalc: recalculate multiple routes atomically
+    const { routes, dpMap, whMap, routeVersion, startTime } = payload;
+    const results = routes.map(route =>
+      recalculateSingleRoute({ route, dpMap, whMap, startTime })
+    );
+    self.postMessage({
+      type: 'RECALC_RESULT',
+      payload: { routes: results, routeVersion, batch: true }
+    });
   }
 };
 
@@ -17,7 +29,7 @@ self.onmessage = function(e) {
 // Core Route Computation
 // ========================
 
-function computeRoutes({ orders, warehouses, deliveryPoints, drivers, vehicles, vehicleCount, strategy }) {
+function computeRoutes({ orders, warehouses, deliveryPoints, drivers, vehicles, vehicleCount, strategy, startTime }) {
   const dpMap = {};
   deliveryPoints.forEach(dp => { dpMap[dp.id] = dp; });
   const whMap = {};
@@ -53,7 +65,7 @@ function computeRoutes({ orders, warehouses, deliveryPoints, drivers, vehicles, 
   const sortedOrders = sortOrdersByStrategy(validOrders, strategy, dpMap, whMap);
 
   // Build routes using heuristic
-  const routes = buildRoutes(sortedOrders, selectedVehicles, availableDrivers, dpMap, whMap, strategy);
+  const routes = buildRoutes(sortedOrders, selectedVehicles, availableDrivers, dpMap, whMap, strategy, startTime);
 
   // Check for remaining unassigned
   const assignedOrderIds = new Set();
@@ -141,7 +153,7 @@ function sortOrdersByStrategy(orders, strategy, dpMap, whMap) {
   return sorted;
 }
 
-function buildRoutes(orders, vehicles, drivers, dpMap, whMap, strategy) {
+function buildRoutes(orders, vehicles, drivers, dpMap, whMap, strategy, startTime) {
   const routes = [];
 
   for (let i = 0; i < vehicles.length; i++) {
@@ -178,7 +190,7 @@ function buildRoutes(orders, vehicles, drivers, dpMap, whMap, strategy) {
 
   // Finalize route calculations
   for (const route of routes) {
-    finalizeRoute(route, dpMap, whMap);
+    finalizeRoute(route, dpMap, whMap, startTime);
   }
 
   return routes;
@@ -314,7 +326,7 @@ function buildGroupingReason(order, dp, warehouse, route, dpMap) {
   return reasons.length > 0 ? reasons.join('; ') : null;
 }
 
-function finalizeRoute(route, dpMap, whMap) {
+function finalizeRoute(route, dpMap, whMap, startTime) {
   if (route.orders.length === 0) return;
 
   const warehouse = whMap[route.orders[0].warehouseId];
@@ -374,7 +386,8 @@ function finalizeRoute(route, dpMap, whMap) {
 
   // Time window violations
   route.timeWindowViolations = [];
-  let currentTime = 8; // Start at 8:00
+  const routeStartTime = startTime || 8;
+  let currentTime = routeStartTime;
   currentPoint = warehouse;
 
   for (const order of route.orders) {
@@ -402,7 +415,7 @@ function finalizeRoute(route, dpMap, whMap) {
   }
 }
 
-function recalculateSingleRoute({ route, dpMap, whMap }) {
+function recalculateSingleRoute({ route, dpMap, whMap, startTime }) {
   // Recreate a route object and recalculate
   const recalculated = {
     ...route,
@@ -416,7 +429,23 @@ function recalculateSingleRoute({ route, dpMap, whMap }) {
     recalculated.totalWeight += order.weight;
   }
 
-  finalizeRoute(recalculated, dpMap, whMap);
+  // Constraint warnings: check capacity
+  const constraintWarnings = [];
+  if (recalculated.totalWeight > route.vehicle.capacity) {
+    constraintWarnings.push('超载: 总重 ' + recalculated.totalWeight + 'kg 超过车辆容量 ' + route.vehicle.capacity + 'kg');
+  }
+
+  finalizeRoute(recalculated, dpMap, whMap, startTime);
+
+  // Additional constraint warnings after finalize
+  if (recalculated.overtimeRisk === 'high') {
+    constraintWarnings.push('超时高风险: 预计 ' + recalculated.estimatedTime + 'h 超过司机最大工时 ' + (route.driver ? route.driver.maxHours : 'N/A') + 'h');
+  }
+  if (recalculated.timeWindowViolations && recalculated.timeWindowViolations.length > 0) {
+    constraintWarnings.push('时间窗违规: ' + recalculated.timeWindowViolations.length + ' 个订单将超时');
+  }
+
+  recalculated.constraintWarnings = constraintWarnings;
   return recalculated;
 }
 

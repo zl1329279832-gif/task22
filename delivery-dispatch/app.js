@@ -22,15 +22,23 @@
     panX: 0,
     panY: 0,
     isPanning: false,
+    panMoved: false,
     panStartX: 0,
     panStartY: 0,
+    panStartClientX: 0,
+    panStartClientY: 0,
 
     // Drag & drop
     dragOrder: null,
     dragSourceRoute: null,
 
     // Route colors
-    routeColors: ['#3b82f6', '#22c55e', '#f59e0b', '#ef4444', '#a855f7', '#06b6d4']
+    routeColors: ['#3b82f6', '#22c55e', '#f59e0b', '#ef4444', '#a855f7', '#06b6d4'],
+
+    // Version tracking for async isolation
+    routeVersion: 0,
+    computeRequestId: 0,
+    pendingRecalcVersions: new Set()
   };
 
   // ===== DOM References =====
@@ -117,6 +125,18 @@
     };
   }
 
+  // Build shared lookup maps from state.data
+  function buildDpMap() {
+    const dpMap = {};
+    if (state.data) state.data.deliveryPoints.forEach(dp => { dpMap[dp.id] = dp; });
+    return dpMap;
+  }
+  function buildWhMap() {
+    const whMap = {};
+    if (state.data) state.data.warehouses.forEach(wh => { whMap[wh.id] = wh; });
+    return whMap;
+  }
+
   // ===== Data Loading =====
   function loadData() {
     fetch('data.json')
@@ -190,7 +210,9 @@
     state.canvas.addEventListener('mousedown', onCanvasMouseDown);
     state.canvas.addEventListener('mousemove', onCanvasMouseMove);
     state.canvas.addEventListener('mouseup', onCanvasMouseUp);
-    state.canvas.addEventListener('mouseleave', onCanvasMouseUp);
+    state.canvas.addEventListener('mouseleave', function() {
+      state.isPanning = false;
+    });
     state.canvas.addEventListener('wheel', onCanvasWheel, { passive: false });
   }
 
@@ -221,29 +243,124 @@
     state.panY = (ch - dataH * state.zoom) / 2 - minY * state.zoom;
   }
 
+  // Convert screen (client) coordinates to data-space coordinates
+  function screenToData(clientX, clientY) {
+    const rect = state.canvas.getBoundingClientRect();
+    return {
+      x: (clientX - rect.left - state.panX) / state.zoom,
+      y: (clientY - rect.top - state.panY) / state.zoom
+    };
+  }
+
+  // Convert data-space coordinates to screen (client) coordinates
+  function dataToScreen(dataX, dataY) {
+    const rect = state.canvas.getBoundingClientRect();
+    return {
+      x: dataX * state.zoom + state.panX + rect.left,
+      y: dataY * state.zoom + state.panY + rect.top
+    };
+  }
+
   function onCanvasMouseDown(e) {
     state.isPanning = true;
+    state.panMoved = false;
     state.panStartX = e.clientX - state.panX;
     state.panStartY = e.clientY - state.panY;
+    state.panStartClientX = e.clientX;
+    state.panStartClientY = e.clientY;
   }
 
   function onCanvasMouseMove(e) {
     if (state.isPanning) {
+      const dx = e.clientX - state.panStartClientX;
+      const dy = e.clientY - state.panStartClientY;
+      if (Math.abs(dx) > 2 || Math.abs(dy) > 2) {
+        state.panMoved = true;
+      }
       state.panX = e.clientX - state.panStartX;
       state.panY = e.clientY - state.panStartY;
       renderCanvas();
     }
   }
 
-  function onCanvasMouseUp() {
+  function onCanvasMouseUp(e) {
+    const wasPanning = state.isPanning;
+    const moved = state.panMoved;
     state.isPanning = false;
+
+    // If the user clicked without dragging, try to select a route by hitting a delivery point
+    if (wasPanning && !moved && state.routes.length > 0 && state.data) {
+      onCanvasClick(e);
+    }
+  }
+
+  function onCanvasClick(e) {
+    const dataPos = screenToData(e.clientX, e.clientY);
+    const hitRadius = 15 / state.zoom; // 15px in screen space
+    const dpMap = buildDpMap();
+
+    // Find nearest delivery point within hit radius
+    let bestDist = Infinity;
+    let bestDp = null;
+
+    for (const dp of state.data.deliveryPoints) {
+      if (dp.x == null || dp.y == null) continue;
+      const dx = dp.x - dataPos.x;
+      const dy = dp.y - dataPos.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist < hitRadius && dist < bestDist) {
+        bestDist = dist;
+        bestDp = dp;
+      }
+    }
+
+    if (bestDp) {
+      // Find which route contains this delivery point
+      let foundRouteIndex = -1;
+      for (let i = 0; i < state.routes.length; i++) {
+        for (const order of state.routes[i].orders) {
+          if (order.deliveryPointId === bestDp.id) {
+            foundRouteIndex = i;
+            break;
+          }
+        }
+        if (foundRouteIndex >= 0) break;
+      }
+
+      if (foundRouteIndex >= 0) {
+        state.selectedRoute = (state.selectedRoute === foundRouteIndex) ? null : foundRouteIndex;
+        renderCanvas();
+        showToast('选中路线 ' + (foundRouteIndex + 1) + ': ' + bestDp.name, 'info');
+      }
+    } else {
+      // Clicked empty space — deselect
+      if (state.selectedRoute !== null) {
+        state.selectedRoute = null;
+        renderCanvas();
+      }
+    }
   }
 
   function onCanvasWheel(e) {
     e.preventDefault();
     const factor = e.deltaY > 0 ? 0.9 : 1.1;
+
+    // Zoom toward cursor position
+    const rect = state.canvas.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left;
+    const mouseY = e.clientY - rect.top;
+
+    // Data point under cursor before zoom
+    const dataX = (mouseX - state.panX) / state.zoom;
+    const dataY = (mouseY - state.panY) / state.zoom;
+
     state.zoom *= factor;
     state.zoom = Math.max(0.3, Math.min(5, state.zoom));
+
+    // Adjust pan so same data point stays under cursor
+    state.panX = mouseX - dataX * state.zoom;
+    state.panY = mouseY - dataY * state.zoom;
+
     renderCanvas();
   }
 
@@ -370,8 +487,12 @@
       const warehouse = whMap[route.orders[0].warehouseId];
       if (!warehouse) continue;
 
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 2;
+      const isSelected = (state.selectedRoute === i);
+      const isDimmed = (state.selectedRoute !== null && !isSelected);
+
+      ctx.strokeStyle = isDimmed ? color + '33' : color;
+      ctx.lineWidth = isSelected ? 3.5 : 2;
+      ctx.globalAlpha = isDimmed ? 0.3 : 1;
       ctx.setLineDash([6, 4]);
       ctx.beginPath();
       ctx.moveTo(warehouse.x, warehouse.y);
@@ -393,7 +514,7 @@
       for (const order of route.orders) {
         const dp = dpMap[order.deliveryPointId];
         if (dp) {
-          ctx.fillStyle = color;
+          ctx.fillStyle = isDimmed ? color + '44' : color;
           ctx.beginPath();
           ctx.arc(dp.x + 10, dp.y - 10, 8, 0, Math.PI * 2);
           ctx.fill();
@@ -405,6 +526,8 @@
           stopNum++;
         }
       }
+
+      ctx.globalAlpha = 1;
     }
   }
 
@@ -421,6 +544,13 @@
 
     const vehicleCount = parseInt(dom.vehicleCount.value);
     const strategy = dom.strategy.value;
+    const startTime = parseInt(dom.startTime.value) || 8;
+
+    // Increment computeRequestId to invalidate any in-flight recalc results
+    state.computeRequestId++;
+    // Bump routeVersion so any pending recalc results become stale
+    state.routeVersion++;
+    state.pendingRecalcVersions.clear();
 
     // Send to Web Worker
     state.worker.postMessage({
@@ -432,15 +562,26 @@
         drivers: state.data.drivers,
         vehicles: state.data.vehicles,
         vehicleCount: vehicleCount,
-        strategy: strategy
+        strategy: strategy,
+        startTime: startTime,
+        requestId: state.computeRequestId
       }
     });
   }
 
   function handleRoutesResult(result) {
+    // Stale result guard: discard if requestId doesn't match current
+    if (result.requestId !== undefined && result.requestId !== state.computeRequestId) {
+      console.log('[Discarded] Stale ROUTES_RESULT, requestId:', result.requestId, 'current:', state.computeRequestId);
+      return;
+    }
+
     state.routes = result.routes;
     state.unassigned = result.unassigned;
     state.stats = result.stats;
+
+    // Clear pending recalcs — they refer to pre-compute route state
+    state.pendingRecalcVersions.clear();
 
     dom.btnCompute.disabled = false;
     dom.btnCompute.innerHTML = '&#9654; 开始调度计算';
@@ -456,15 +597,40 @@
     showToast('调度计算完成', 'success');
   }
 
-  function handleRecalcResult(result) {
-    // Update the specific route
-    const idx = state.routes.findIndex(r => r.id === result.id);
-    if (idx >= 0) {
-      state.routes[idx] = result;
-      updateStatsBar();
-      renderRouteList();
-      renderCanvas();
+  function handleRecalcResult(payload) {
+    // Stale result guard: discard if routeVersion is older than current
+    if (payload.routeVersion !== undefined && payload.routeVersion < state.routeVersion) {
+      console.log('[Discarded] Stale RECALC_RESULT, version:', payload.routeVersion, 'current:', state.routeVersion);
+      state.pendingRecalcVersions.delete(payload.routeVersion);
+      return;
     }
+
+    if (payload.batch && Array.isArray(payload.routes)) {
+      // Batch result: apply all routes atomically
+      for (const result of payload.routes) {
+        const idx = state.routes.findIndex(r => r.id === result.id);
+        if (idx >= 0) {
+          state.routes[idx] = result;
+        }
+      }
+    } else {
+      // Single route result (legacy)
+      const idx = state.routes.findIndex(r => r.id === payload.id);
+      if (idx >= 0) {
+        state.routes[idx] = payload;
+      }
+    }
+
+    // Clean up pending tracking
+    if (payload.routeVersion !== undefined) {
+      state.pendingRecalcVersions.delete(payload.routeVersion);
+    }
+
+    // Re-aggregate stats from current routes
+    recalcGlobalStats();
+    updateStatsBar();
+    renderRouteList();
+    renderCanvas();
   }
 
   // ===== Stats Bar =====
@@ -527,6 +693,15 @@
             <h4>时间窗违规 (${route.timeWindowViolations.length})</h4>
             ${route.timeWindowViolations.map(v => `
               <div class="violation-item">${v.orderId}: 预计 ${formatTime(v.expectedArrival)} 到达, 截止 ${formatTime(v.windowEnd)}, 延误 ${v.delay} 分钟</div>
+            `).join('')}
+          </div>
+        ` : ''}
+
+        ${route.constraintWarnings && route.constraintWarnings.length > 0 ? `
+          <div class="violations">
+            <h4>&#9888; 约束警告 (${route.constraintWarnings.length})</h4>
+            ${route.constraintWarnings.map(w => `
+              <div class="violation-item">${w}</div>
             `).join('')}
           </div>
         ` : ''}
@@ -627,65 +802,103 @@
     if (orderIdx < 0) return;
 
     const order = fromRoute.orders[orderIdx];
+    const dpMap = buildDpMap();
+    const whMap = buildWhMap();
+    const startTime = parseInt(dom.startTime.value) || 8;
 
-    // Check capacity
+    // --- Hard constraint: capacity ---
     if (toRoute.totalWeight + order.weight > toRoute.vehicle.capacity) {
-      showToast('目标车辆容量不足! 剩余容量: ' + (toRoute.vehicle.capacity - toRoute.totalWeight) + 'kg', 'error');
+      showToast('目标车辆容量不足! 剩余容量: ' + (toRoute.vehicle.capacity - toRoute.totalWeight) + 'kg, 订单重量: ' + order.weight + 'kg', 'error');
       return;
     }
 
-    // Move order
+    // --- Simulate the move to check soft constraints ---
+    const simFrom = JSON.parse(JSON.stringify(fromRoute));
+    const simTo = JSON.parse(JSON.stringify(toRoute));
+    simFrom.orders.splice(orderIdx, 1);
+    simFrom.totalWeight -= order.weight;
+    simTo.orders.push(JSON.parse(JSON.stringify(order)));
+    simTo.totalWeight += order.weight;
+
+    localRecalcRoute(simFrom, dpMap, whMap, startTime);
+    localRecalcRoute(simTo, dpMap, whMap, startTime);
+
+    // Collect warnings from simulated target route
+    const warnings = [];
+    const origToViolations = (toRoute.timeWindowViolations || []).length;
+    const newToViolations = (simTo.timeWindowViolations || []).length;
+    if (newToViolations > origToViolations) {
+      warnings.push('目标路线将新增 ' + (newToViolations - origToViolations) + ' 个时间窗违规');
+    }
+
+    if (simTo.driver && simTo.estimatedTime > simTo.driver.maxHours) {
+      const overtimeMin = Math.round((simTo.estimatedTime - simTo.driver.maxHours) * 60);
+      warnings.push('目标路线司机 ' + simTo.driver.name + ' 将超时 ' + overtimeMin + ' 分钟');
+    }
+
+    if (simTo.overtimeRisk === 'high' && toRoute.overtimeRisk !== 'high') {
+      warnings.push('目标路线超时风险升级为高风险');
+    }
+
+    // Show warnings but allow the move
+    if (warnings.length > 0) {
+      showToast('移动警告: ' + warnings.join('; '), 'warning');
+    }
+
+    // --- Apply the move ---
     fromRoute.orders.splice(orderIdx, 1);
     fromRoute.totalWeight -= order.weight;
     toRoute.orders.push(order);
     toRoute.totalWeight += order.weight;
 
-    // Recalculate both routes
-    recalcRoute(fromRoute);
-    recalcRoute(toRoute);
+    // Increment route version to invalidate any previous pending recalcs
+    state.routeVersion++;
+    state.pendingRecalcVersions.add(state.routeVersion);
 
-    // Update global stats
+    // Local recalc for immediate feedback
+    localRecalcRoute(fromRoute, dpMap, whMap, startTime);
+    localRecalcRoute(toRoute, dpMap, whMap, startTime);
+
+    // Update global stats from locally recalculated routes
     recalcGlobalStats();
-
-    // Update UI
     updateStatsBar();
     renderRouteList();
     renderCanvas();
 
+    // Batch send to worker for authoritative recalc
+    state.worker.postMessage({
+      type: 'RECALCULATE_ROUTES',
+      payload: {
+        routes: [fromRoute, toRoute],
+        dpMap: dpMap,
+        whMap: whMap,
+        startTime: startTime,
+        routeVersion: state.routeVersion
+      }
+    });
+
     showToast(orderId + ' 已从路线 ' + (fromIndex + 1) + ' 移至路线 ' + (toIndex + 1), 'info');
   }
 
-  function recalcRoute(route) {
-    const dpMap = {};
-    state.data.deliveryPoints.forEach(dp => { dpMap[dp.id] = dp; });
-    const whMap = {};
-    state.data.warehouses.forEach(wh => { whMap[wh.id] = wh; });
-
-    // Send to worker for recalculation
-    state.worker.postMessage({
-      type: 'RECALCULATE_ROUTE',
-      payload: { route, dpMap, whMap }
-    });
-
-    // Also do local recalc for immediate feedback
-    localRecalcRoute(route, dpMap, whMap);
-  }
-
-  function localRecalcRoute(route, dpMap, whMap) {
+  function localRecalcRoute(route, dpMap, whMap, startTime) {
     if (route.orders.length === 0) {
       route.totalDistance = 0;
       route.estimatedTime = 0;
       route.drivingTime = 0;
       route.restTime = 0;
+      route.serviceTime = 0;
       route.loadRate = 0;
       route.overtimeRisk = 'low';
+      route.overtimeMinutes = 0;
       route.timeWindowViolations = [];
+      route.constraintWarnings = [];
       return;
     }
 
     const warehouse = whMap[route.orders[0].warehouseId];
     if (!warehouse) return;
 
+    // --- Distance: warehouse -> stops -> warehouse (return-to-warehouse) ---
     let totalDist = 0;
     let currentPoint = warehouse;
 
@@ -699,18 +912,23 @@
       }
     }
 
-    const dx = (currentPoint.x || 0) - (warehouse.x || 0);
-    const dy = (currentPoint.y || 0) - (warehouse.y || 0);
-    totalDist += Math.sqrt(dx * dx + dy * dy);
+    // Return to warehouse
+    const rdx = (currentPoint.x || 0) - (warehouse.x || 0);
+    const rdy = (currentPoint.y || 0) - (warehouse.y || 0);
+    totalDist += Math.sqrt(rdx * rdx + rdy * rdy);
 
     route.totalDistance = Math.round(totalDist);
 
+    // --- Time calculation ---
     const drivingTime = totalDist / route.vehicle.speed;
+
+    // Driver rest stops (based on driving time only)
     let restTime = 0;
     if (route.driver) {
       const restStops = Math.floor(drivingTime / route.driver.restAfterHours);
       restTime = restStops * route.driver.restDuration;
     }
+
     const serviceTime = route.orders.length * 0.25;
 
     route.estimatedTime = Math.round((drivingTime + restTime + serviceTime) * 100) / 100;
@@ -719,6 +937,7 @@
     route.serviceTime = serviceTime;
     route.loadRate = Math.round((route.totalWeight / route.vehicle.capacity) * 100);
 
+    // --- Overtime risk ---
     if (route.driver) {
       route.overtimeRisk = route.estimatedTime > route.driver.maxHours
         ? 'high'
@@ -727,12 +946,17 @@
           : 'low';
       route.overtimeMinutes = Math.max(0,
         Math.round((route.estimatedTime - route.driver.maxHours) * 60));
+    } else {
+      route.overtimeRisk = 'unknown';
+      route.overtimeMinutes = 0;
     }
 
-    // Time window check
+    // --- Time window violations ---
+    const constraintWarnings = [];
     route.timeWindowViolations = [];
-    let currentTime = parseInt(dom.startTime.value) || 8;
+    let currentTime = startTime || 8;
     currentPoint = warehouse;
+
     for (const order of route.orders) {
       const dp = dpMap[order.deliveryPointId];
       if (dp) {
@@ -741,7 +965,11 @@
         const dist = Math.sqrt(ddx * ddx + ddy * ddy);
         const travelTime = dist / route.vehicle.speed;
         currentTime += travelTime;
-        if (currentTime < order.timeWindowStart) currentTime = order.timeWindowStart;
+
+        if (currentTime < order.timeWindowStart) {
+          currentTime = order.timeWindowStart; // Wait until window opens
+        }
+
         if (currentTime > order.timeWindowEnd) {
           route.timeWindowViolations.push({
             orderId: order.id,
@@ -750,10 +978,23 @@
             delay: Math.round((currentTime - order.timeWindowEnd) * 60)
           });
         }
-        currentTime += 0.25;
+
+        currentTime += 0.25; // Service time at stop
         currentPoint = dp;
       }
     }
+
+    // Constraint warnings
+    if (route.totalWeight > route.vehicle.capacity) {
+      constraintWarnings.push('超载: ' + route.totalWeight + 'kg > ' + route.vehicle.capacity + 'kg');
+    }
+    if (route.overtimeRisk === 'high') {
+      constraintWarnings.push('超时高风险: ' + route.estimatedTime + 'h > ' + (route.driver ? route.driver.maxHours : '?') + 'h');
+    }
+    if (route.timeWindowViolations.length > 0) {
+      constraintWarnings.push('时间窗违规: ' + route.timeWindowViolations.length + ' 个订单');
+    }
+    route.constraintWarnings = constraintWarnings;
   }
 
   // ===== Unassigned Orders =====
