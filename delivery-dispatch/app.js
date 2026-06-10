@@ -38,7 +38,19 @@
     // Version tracking for async isolation
     routeVersion: 0,
     computeRequestId: 0,
-    pendingRecalcVersions: new Set()
+    pendingRecalcVersions: new Set(),
+
+    // Multi-objective optimization
+    objectives: {
+      minDistance:    { enabled: true,  weight: 50 },
+      minViolation:  { enabled: false, weight: 50 },
+      loadBalance:   { enabled: false, weight: 50 },
+      driverFairness:{ enabled: false, weight: 50 },
+      coldChainFirst:{ enabled: false, weight: 50 }
+    },
+
+    // Route locking
+    lockedRouteIds: new Set()
   };
 
   // ===== DOM References =====
@@ -84,6 +96,23 @@
     dom.statUnassigned = document.getElementById('statUnassigned');
     dom.statLoadRate = document.getElementById('statLoadRate');
     dom.statRisk = document.getElementById('statRisk');
+
+    // Objective controls
+    dom.objMinDist = document.getElementById('objMinDist');
+    dom.objMinDistW = document.getElementById('objMinDistW');
+    dom.objMinDistWL = document.getElementById('objMinDistWL');
+    dom.objMinViol = document.getElementById('objMinViol');
+    dom.objMinViolW = document.getElementById('objMinViolW');
+    dom.objMinViolWL = document.getElementById('objMinViolWL');
+    dom.objLoadBal = document.getElementById('objLoadBal');
+    dom.objLoadBalW = document.getElementById('objLoadBalW');
+    dom.objLoadBalWL = document.getElementById('objLoadBalWL');
+    dom.objDriverFair = document.getElementById('objDriverFair');
+    dom.objDriverFairW = document.getElementById('objDriverFairW');
+    dom.objDriverFairWL = document.getElementById('objDriverFairWL');
+    dom.objColdChain = document.getElementById('objColdChain');
+    dom.objColdChainW = document.getElementById('objColdChainW');
+    dom.objColdChainWL = document.getElementById('objColdChainWL');
   }
 
   // ===== Initialization =====
@@ -209,6 +238,24 @@
     // Canvas mouse events
     state.canvas.addEventListener('mousedown', onCanvasMouseDown);
     state.canvas.addEventListener('mousemove', onCanvasMouseMove);
+
+    // Objective weight sliders
+    var sliderPairs = [
+      ['objMinDistW', 'objMinDistWL'],
+      ['objMinViolW', 'objMinViolWL'],
+      ['objLoadBalW', 'objLoadBalWL'],
+      ['objDriverFairW', 'objDriverFairWL'],
+      ['objColdChainW', 'objColdChainWL']
+    ];
+    sliderPairs.forEach(function(pair) {
+      var slider = dom[pair[0]];
+      var label = dom[pair[1]];
+      if (slider && label) {
+        slider.addEventListener('input', function() {
+          label.textContent = this.value;
+        });
+      }
+    });
     state.canvas.addEventListener('mouseup', onCanvasMouseUp);
     state.canvas.addEventListener('mouseleave', function() {
       state.isPanning = false;
@@ -443,6 +490,23 @@
   }
 
   function drawDeliveryPoints(ctx) {
+    // Pre-compute violated and cold chain delivery point IDs
+    var violatedDpIds = {};
+    var coldChainDpIds = {};
+    for (var ri = 0; ri < state.routes.length; ri++) {
+      var route = state.routes[ri];
+      if (route.timeWindowViolations) {
+        for (var vi = 0; vi < route.timeWindowViolations.length; vi++) {
+          var v = route.timeWindowViolations[vi];
+          var vOrder = route.orders.find(function(o) { return o.id === v.orderId; });
+          if (vOrder) violatedDpIds[vOrder.deliveryPointId] = true;
+        }
+      }
+      for (var oi = 0; oi < route.orders.length; oi++) {
+        if (route.orders[oi].coldChain) coldChainDpIds[route.orders[oi].deliveryPointId] = true;
+      }
+    }
+
     for (const dp of state.data.deliveryPoints) {
       // Check if this point is part of a route
       let routeColor = null;
@@ -457,13 +521,48 @@
         if (routeColor) break;
       }
 
+      var isViolated = violatedDpIds[dp.id];
+      var isColdChain = coldChainDpIds[dp.id];
+
+      // Violation outer glow
+      if (isViolated) {
+        ctx.beginPath();
+        ctx.arc(dp.x, dp.y, 12, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(239, 68, 68, 0.25)';
+        ctx.fill();
+        ctx.strokeStyle = '#ef4444';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+
+      // Cold chain outer glow (only if not violated)
+      if (isColdChain && !isViolated) {
+        ctx.beginPath();
+        ctx.arc(dp.x, dp.y, 11, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(56, 189, 248, 0.2)';
+        ctx.fill();
+        ctx.strokeStyle = '#38bdf8';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+      }
+
+      // Main dot
       ctx.beginPath();
       ctx.arc(dp.x, dp.y, 6, 0, Math.PI * 2);
-      ctx.fillStyle = routeColor || '#22c55e';
+      ctx.fillStyle = isViolated ? '#ef4444' : (isColdChain ? '#38bdf8' : (routeColor || '#22c55e'));
       ctx.fill();
       ctx.strokeStyle = routeColor ? routeColor + '88' : '#86efac';
       ctx.lineWidth = 1.5;
       ctx.stroke();
+
+      // Cold chain star marker
+      if (isColdChain) {
+        ctx.fillStyle = '#38bdf8';
+        ctx.font = '10px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('*', dp.x - 10, dp.y - 8);
+      }
 
       // Label
       ctx.fillStyle = '#8899aa';
@@ -489,11 +588,19 @@
 
       const isSelected = (state.selectedRoute === i);
       const isDimmed = (state.selectedRoute !== null && !isSelected);
+      const isLocked = route.locked;
 
       ctx.strokeStyle = isDimmed ? color + '33' : color;
-      ctx.lineWidth = isSelected ? 3.5 : 2;
+      ctx.lineWidth = isSelected ? 3.5 : (isLocked ? 3 : 2);
       ctx.globalAlpha = isDimmed ? 0.3 : 1;
-      ctx.setLineDash([6, 4]);
+
+      // Locked routes use solid line, others use dashed
+      if (isLocked) {
+        ctx.setLineDash([]);
+      } else {
+        ctx.setLineDash([6, 4]);
+      }
+
       ctx.beginPath();
       ctx.moveTo(warehouse.x, warehouse.y);
 
@@ -508,6 +615,22 @@
       ctx.lineTo(warehouse.x, warehouse.y);
       ctx.stroke();
       ctx.setLineDash([]);
+
+      // Draw lock icon for locked routes
+      if (isLocked && !isDimmed) {
+        // Draw lock icon as geometric shape
+        var lx = warehouse.x + 20;
+        var ly = warehouse.y - 20;
+        ctx.fillStyle = '#f59e0b';
+        // Lock body
+        ctx.fillRect(lx - 5, ly - 2, 10, 8);
+        // Lock shackle
+        ctx.strokeStyle = '#f59e0b';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(lx, ly - 2, 4, Math.PI, 0);
+        ctx.stroke();
+      }
 
       // Draw stop numbers
       let stopNum = 1;
@@ -532,6 +655,16 @@
   }
 
   // ===== Route Computation =====
+  function readObjectives() {
+    return {
+      minDistance:    { enabled: dom.objMinDist.checked,    weight: parseInt(dom.objMinDistW.value) },
+      minViolation:  { enabled: dom.objMinViol.checked,    weight: parseInt(dom.objMinViolW.value) },
+      loadBalance:   { enabled: dom.objLoadBal.checked,    weight: parseInt(dom.objLoadBalW.value) },
+      driverFairness:{ enabled: dom.objDriverFair.checked, weight: parseInt(dom.objDriverFairW.value) },
+      coldChainFirst:{ enabled: dom.objColdChain.checked,  weight: parseInt(dom.objColdChainW.value) }
+    };
+  }
+
   function startComputation() {
     if (!state.data) {
       showToast('请先加载数据', 'warning');
@@ -542,9 +675,22 @@
     dom.btnCompute.innerHTML = '<span class="spinner"></span> 计算中...';
     dom.canvasInfo.textContent = '正在计算最优路线...';
 
-    const vehicleCount = parseInt(dom.vehicleCount.value);
-    const strategy = dom.strategy.value;
-    const startTime = parseInt(dom.startTime.value) || 8;
+    var vehicleCount = parseInt(dom.vehicleCount.value);
+    var objectives = readObjectives();
+    var startTime = parseInt(dom.startTime.value) || 8;
+
+    // Collect locked routes
+    var lockedRoutes = [];
+    var lockedOrderIds = [];
+    for (var i = 0; i < state.routes.length; i++) {
+      var route = state.routes[i];
+      if (route.locked) {
+        lockedRoutes.push(route);
+        for (var j = 0; j < route.orders.length; j++) {
+          lockedOrderIds.push(route.orders[j].id);
+        }
+      }
+    }
 
     // Increment computeRequestId to invalidate any in-flight recalc results
     state.computeRequestId++;
@@ -562,9 +708,11 @@
         drivers: state.data.drivers,
         vehicles: state.data.vehicles,
         vehicleCount: vehicleCount,
-        strategy: strategy,
+        objectives: objectives,
         startTime: startTime,
-        requestId: state.computeRequestId
+        requestId: state.computeRequestId,
+        lockedRoutes: lockedRoutes,
+        lockedOrderIds: lockedOrderIds
       }
     });
   }
@@ -576,12 +724,34 @@
       return;
     }
 
-    state.routes = result.routes;
+    // Merge locked routes back with newly computed routes
+    if (result.lockedRoutes && result.lockedRoutes.length > 0) {
+      var allRoutes = [];
+      for (var li = 0; li < result.lockedRoutes.length; li++) {
+        var lr = result.lockedRoutes[li];
+        lr.locked = true;
+        allRoutes.push(lr);
+      }
+      for (var ni = 0; ni < result.routes.length; ni++) {
+        var nr = result.routes[ni];
+        nr.locked = false;
+        allRoutes.push(nr);
+      }
+      state.routes = allRoutes;
+    } else {
+      state.routes = result.routes;
+    }
+
     state.unassigned = result.unassigned;
     state.stats = result.stats;
 
     // Clear pending recalcs — they refer to pre-compute route state
     state.pendingRecalcVersions.clear();
+    // Rebuild locked set
+    state.lockedRouteIds = new Set();
+    for (var ri = 0; ri < state.routes.length; ri++) {
+      if (state.routes[ri].locked) state.lockedRouteIds.add(state.routes[ri].id);
+    }
 
     dom.btnCompute.disabled = false;
     dom.btnCompute.innerHTML = '&#9654; 开始调度计算';
@@ -658,7 +828,7 @@
 
   function createRouteCard(route, index) {
     const card = document.createElement('div');
-    card.className = 'route-card expanded';
+    card.className = 'route-card expanded' + (route.locked ? ' locked' : '');
     card.dataset.routeIndex = index;
 
     const colorClass = 'route-color-' + ((index % 6) + 1);
@@ -670,13 +840,19 @@
       'unknown': '未知'
     }[route.overtimeRisk] || '未知';
 
+    var lockIcon = route.locked ? '&#128274;' : '&#128275;';
+    var lockClass = route.locked ? 'locked' : '';
+
     card.innerHTML = `
       <div class="route-card-header ${colorClass}">
         <div>
           <div class="route-title">路线 ${index + 1} - ${route.vehicle ? route.vehicle.name : 'N/A'}</div>
           <div class="route-meta">${route.driver ? route.driver.name : '无司机'} | ${route.orders.length} 个订单</div>
         </div>
-        <span class="risk-badge ${riskClass}">${riskText}</span>
+        <div class="route-header-right">
+          <button class="route-lock-btn ${lockClass}" data-route-id="${route.id}" title="${route.locked ? '解锁路线' : '锁定路线'}">${lockIcon}</button>
+          <span class="risk-badge ${riskClass}">${riskText}</span>
+        </div>
       </div>
       <div class="route-card-body">
         <div class="route-stats">
@@ -714,7 +890,7 @@
         ` : ''}
 
         <ul class="order-list" data-route-index="${index}">
-          ${route.orders.map(order => createOrderItemHTML(order, index)).join('')}
+          ${route.orders.map(order => createOrderItemHTML(order, index, route)).join('')}
         </ul>
       </div>
     `;
@@ -732,19 +908,41 @@
       orderList.addEventListener('dragover', onOrderDragOver);
       orderList.addEventListener('drop', onOrderDrop);
       orderList.addEventListener('dragleave', onOrderDragLeave);
+
+      // Lock button binding
+      var lockBtn = card.querySelector('.route-lock-btn');
+      if (lockBtn) {
+        lockBtn.addEventListener('click', function(e) {
+          e.stopPropagation();
+          toggleRouteLock(this.dataset.routeId);
+        });
+      }
     }, 0);
 
     return card;
   }
 
-  function createOrderItemHTML(order, routeIndex) {
+  function createOrderItemHTML(order, routeIndex, route) {
     const dp = state.data.deliveryPoints.find(d => d.id === order.deliveryPointId);
+    var coldChainBadge = order.coldChain ? '<span class="coldchain-badge" title="冷链">&#10052;</span>' : '';
+
+    var etaHtml = '';
+    if (route && route.stopETAs) {
+      var etaInfo = route.stopETAs.find(function(s) { return s.orderId === order.id; });
+      if (etaInfo) {
+        var isViolated = etaInfo.eta > order.timeWindowEnd;
+        var etaClass = isViolated ? 'order-eta violated' : 'order-eta';
+        etaHtml = '<span class="' + etaClass + '">ETA ' + formatTime(etaInfo.eta) + '</span>';
+      }
+    }
+
     return `
       <li class="order-item" data-order-id="${order.id}" data-route-index="${routeIndex}">
         <div>
-          <span class="priority-badge priority-${order.priority}"></span>
+          ${coldChainBadge}<span class="priority-badge priority-${order.priority}"></span>
           <span class="order-id">${order.id}</span>
           <span class="order-weight">${order.weight}kg</span>
+          ${etaHtml}
         </div>
         <span class="order-time">${formatTime(order.timeWindowStart)}-${formatTime(order.timeWindowEnd)}${dp ? ' ' + dp.name : ''}</span>
       </li>
@@ -752,6 +950,24 @@
   }
 
   // ===== Drag & Drop =====
+  function toggleRouteLock(routeId) {
+    var route = state.routes.find(function(r) { return r.id === routeId; });
+    if (!route) return;
+
+    route.locked = !route.locked;
+
+    if (route.locked) {
+      state.lockedRouteIds.add(routeId);
+      showToast('路线 ' + routeId + ' 已锁定，重算时将保持不变', 'info');
+    } else {
+      state.lockedRouteIds.delete(routeId);
+      showToast('路线 ' + routeId + ' 已解锁', 'info');
+    }
+
+    renderRouteList();
+    renderCanvas();
+  }
+
   function onOrderDragStart(e) {
     const orderId = e.target.dataset.orderId;
     const routeIndex = parseInt(e.target.dataset.routeIndex);
@@ -797,6 +1013,12 @@
     const fromRoute = state.routes[fromIndex];
     const toRoute = state.routes[toIndex];
     if (!fromRoute || !toRoute) return;
+
+    // Lock constraint: cannot drag out of a locked route
+    if (fromRoute.locked) {
+      showToast('无法移动: 路线 ' + (fromIndex + 1) + ' 已锁定', 'error');
+      return;
+    }
 
     const orderIdx = fromRoute.orders.findIndex(o => o.id === orderId);
     if (orderIdx < 0) return;
@@ -954,6 +1176,7 @@
     // --- Time window violations ---
     const constraintWarnings = [];
     route.timeWindowViolations = [];
+    route.stopETAs = [];
     let currentTime = startTime || 8;
     currentPoint = warehouse;
 
@@ -966,9 +1189,17 @@
         const travelTime = dist / route.vehicle.speed;
         currentTime += travelTime;
 
+        var waitTime = 0;
         if (currentTime < order.timeWindowStart) {
+          waitTime = Math.round((order.timeWindowStart - currentTime) * 60);
           currentTime = order.timeWindowStart; // Wait until window opens
         }
+
+        route.stopETAs.push({
+          orderId: order.id,
+          eta: Math.round(currentTime * 100) / 100,
+          waitTime: waitTime
+        });
 
         if (currentTime > order.timeWindowEnd) {
           route.timeWindowViolations.push({
@@ -1010,8 +1241,10 @@
     for (const item of state.unassigned) {
       const div = document.createElement('div');
       div.className = 'unassigned-item';
+      var coldBadge = item.order.coldChain ? '<span class="coldchain-badge" title="冷链">&#10052;</span>' : '';
       div.innerHTML = `
         <span class="order-id">${item.order.id}</span>
+        ${coldBadge}
         <span class="order-weight">${item.order.weight}kg</span>
         <div class="unassigned-reason">${item.reasons.join('<br>')}</div>
       `;
@@ -1103,12 +1336,13 @@
       exportTime: new Date().toISOString(),
       parameters: {
         vehicleCount: parseInt(dom.vehicleCount.value),
-        strategy: dom.strategy.value,
+        objectives: readObjectives(),
         startTime: dom.startTime.value
       },
       stats: state.stats,
       routes: state.routes.map((r, i) => ({
         routeIndex: i + 1,
+        locked: r.locked || false,
         vehicle: r.vehicle,
         driver: r.driver,
         orders: r.orders,
@@ -1121,6 +1355,7 @@
         overtimeRisk: r.overtimeRisk,
         overtimeMinutes: r.overtimeMinutes,
         timeWindowViolations: r.timeWindowViolations,
+        stopETAs: r.stopETAs || [],
         groupingReasons: r.groupingReason
       })),
       unassigned: state.unassigned
@@ -1148,7 +1383,7 @@
       timestamp: new Date().toISOString(),
       parameters: {
         vehicleCount: parseInt(dom.vehicleCount.value),
-        strategy: dom.strategy.value,
+        objectives: readObjectives(),
         startTime: dom.startTime.value
       },
       data: state.data,
@@ -1185,8 +1420,37 @@
       if (saveData.parameters) {
         dom.vehicleCount.value = saveData.parameters.vehicleCount;
         dom.vehicleCountLabel.textContent = saveData.parameters.vehicleCount;
-        dom.strategy.value = saveData.parameters.strategy;
         dom.startTime.value = saveData.parameters.startTime;
+
+        // Restore objectives if saved; handle old format with strategy
+        if (saveData.parameters.objectives) {
+          var obj = saveData.parameters.objectives;
+          dom.objMinDist.checked = obj.minDistance ? obj.minDistance.enabled : false;
+          dom.objMinDistW.value = obj.minDistance ? obj.minDistance.weight : 50;
+          dom.objMinDistWL.textContent = dom.objMinDistW.value;
+          dom.objMinViol.checked = obj.minViolation ? obj.minViolation.enabled : false;
+          dom.objMinViolW.value = obj.minViolation ? obj.minViolation.weight : 50;
+          dom.objMinViolWL.textContent = dom.objMinViolW.value;
+          dom.objLoadBal.checked = obj.loadBalance ? obj.loadBalance.enabled : false;
+          dom.objLoadBalW.value = obj.loadBalance ? obj.loadBalance.weight : 50;
+          dom.objLoadBalWL.textContent = dom.objLoadBalW.value;
+          dom.objDriverFair.checked = obj.driverFairness ? obj.driverFairness.enabled : false;
+          dom.objDriverFairW.value = obj.driverFairness ? obj.driverFairness.weight : 50;
+          dom.objDriverFairWL.textContent = dom.objDriverFairW.value;
+          dom.objColdChain.checked = obj.coldChainFirst ? obj.coldChainFirst.enabled : false;
+          dom.objColdChainW.value = obj.coldChainFirst ? obj.coldChainFirst.weight : 50;
+          dom.objColdChainWL.textContent = dom.objColdChainW.value;
+        } else if (saveData.parameters.strategy) {
+          // Legacy: just set minDistance enabled
+          dom.objMinDist.checked = true;
+          dom.strategy.value = saveData.parameters.strategy;
+        }
+      }
+
+      // Restore locked route IDs
+      state.lockedRouteIds = new Set();
+      for (var ri = 0; ri < state.routes.length; ri++) {
+        if (state.routes[ri].locked) state.lockedRouteIds.add(state.routes[ri].id);
       }
 
       // Update UI

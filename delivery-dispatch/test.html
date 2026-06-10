@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>配送调度 - 自动化测试</title>
+  <style>
+    body { font-family: 'Segoe UI', sans-serif; padding: 20px; background: #1a1a2e; color: #e0e0e0; }
+    h1 { color: #3b82f6; margin-bottom: 4px; }
+    .subtitle { color: #8899aa; margin-bottom: 20px; }
+    .test-group { margin: 16px 0; padding: 12px; border: 1px solid #333; border-radius: 8px; background: #16213e; }
+    .test-group h2 { font-size: 15px; color: #a5b4fc; margin: 0 0 10px 0; }
+    .test-case { padding: 4px 0; font-size: 13px; }
+    .pass { color: #22c55e; }
+    .pass::before { content: "\2713 "; }
+    .fail { color: #ef4444; }
+    .fail::before { content: "\2717 "; }
+    #summary { margin-top: 24px; font-size: 18px; font-weight: bold; padding: 12px; border-radius: 8px; }
+    #summary.all-pass { background: rgba(34,197,94,0.15); color: #22c55e; border: 1px solid #22c55e; }
+    #summary.has-fail { background: rgba(239,68,68,0.15); color: #ef4444; border: 1px solid #ef4444; }
+  </style>
+</head>
+<body>
+  <h1>配送调度系统 - 自动化测试</h1>
+  <p class="subtitle">验证多目标调度、锁线、版本隔离、约束检查与导出一致性</p>
+  <div id="results"></div>
+  <div id="summary"></div>
+
+  <!-- Load worker.js functions into global scope -->
+  <script>
+    // worker.js uses self.onmessage; aliasing self is not needed since
+    // in browser global scope 'self' already equals 'window'.
+    // The onmessage handler will be harmlessly set on window.
+  </script>
+  <script src="worker.js"></script>
+  <script src="test.js"></script>
+</body>
+</html>

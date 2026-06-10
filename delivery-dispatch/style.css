@@ -705,6 +705,105 @@ html, body {
   background: var(--text-muted);
 }
 
+/* ===== Objectives ===== */
+.objectives-group label {
+  margin-bottom: 8px;
+}
+.objective-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+  font-size: 12px;
+}
+.objective-item input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--accent);
+  flex-shrink: 0;
+}
+.obj-label {
+  min-width: 64px;
+  color: var(--text-secondary);
+}
+.obj-slider {
+  flex: 1;
+  height: 4px;
+}
+.obj-weight {
+  min-width: 24px;
+  text-align: right;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+/* ===== Lock Button ===== */
+.route-lock-btn {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-muted);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 2px 6px;
+  margin-right: 6px;
+  transition: all 0.2s;
+}
+.route-lock-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.route-lock-btn.locked {
+  color: var(--warning);
+  border-color: var(--warning);
+  background: rgba(245, 158, 11, 0.1);
+}
+.route-card.locked {
+  border-color: var(--warning);
+  box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.3) inset;
+}
+.route-card.locked .route-card-header {
+  background: rgba(245, 158, 11, 0.05);
+}
+
+/* ===== Cold Chain Badge ===== */
+.coldchain-badge {
+  color: #38bdf8;
+  font-size: 12px;
+  margin-right: 2px;
+}
+
+/* ===== Order ETA ===== */
+.order-eta {
+  font-size: 10px;
+  color: var(--info);
+  margin-left: 4px;
+}
+.order-eta.violated {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+/* ===== Legend New Items ===== */
+.legend-dot.locked {
+  background: var(--warning);
+  border: 2px solid #fcd34d;
+}
+.legend-dot.violation {
+  background: var(--danger);
+  border: 2px solid #fca5a5;
+}
+.legend-dot.coldchain {
+  background: #38bdf8;
+  border: 2px solid #7dd3fc;
+}
+
+/* ===== Route Card Header Flex ===== */
+.route-header-right {
+  display: flex;
+  align-items: center;
+}
+
 /* ===== Responsive tweaks ===== */
 @media (max-width: 1200px) {
   .panel-left { width: 240px; min-width: 240px; }

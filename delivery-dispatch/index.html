@@ -41,7 +41,7 @@
           <input type="range" id="vehicleCount" min="1" max="6" value="4">
           <span id="vehicleCountLabel">4</span> 辆
         </div>
-        <div class="form-group">
+        <div class="form-group" style="display:none">
           <label>配送策略</label>
           <select id="strategy">
             <option value="balanced">均衡策略</option>
@@ -49,6 +49,39 @@
             <option value="time_window">时间窗优先</option>
             <option value="nearest_first">就近配送</option>
           </select>
+        </div>
+        <div class="form-group objectives-group">
+          <label>优化目标（可多选）</label>
+          <div class="objective-item">
+            <input type="checkbox" id="objMinDist" checked>
+            <span class="obj-label">最短里程</span>
+            <input type="range" id="objMinDistW" min="0" max="100" value="50" class="obj-slider">
+            <span class="obj-weight" id="objMinDistWL">50</span>
+          </div>
+          <div class="objective-item">
+            <input type="checkbox" id="objMinViol">
+            <span class="obj-label">最少超时</span>
+            <input type="range" id="objMinViolW" min="0" max="100" value="50" class="obj-slider">
+            <span class="obj-weight" id="objMinViolWL">50</span>
+          </div>
+          <div class="objective-item">
+            <input type="checkbox" id="objLoadBal">
+            <span class="obj-label">装载均衡</span>
+            <input type="range" id="objLoadBalW" min="0" max="100" value="50" class="obj-slider">
+            <span class="obj-weight" id="objLoadBalWL">50</span>
+          </div>
+          <div class="objective-item">
+            <input type="checkbox" id="objDriverFair">
+            <span class="obj-label">司机公平</span>
+            <input type="range" id="objDriverFairW" min="0" max="100" value="50" class="obj-slider">
+            <span class="obj-weight" id="objDriverFairWL">50</span>
+          </div>
+          <div class="objective-item">
+            <input type="checkbox" id="objColdChain">
+            <span class="obj-label">冷链优先</span>
+            <input type="range" id="objColdChainW" min="0" max="100" value="50" class="obj-slider">
+            <span class="obj-weight" id="objColdChainWL">50</span>
+          </div>
         </div>
         <div class="form-group">
           <label>出发时间</label>
@@ -103,6 +136,9 @@
           <div class="legend-item"><span class="legend-dot route2"></span> 路线 2</div>
           <div class="legend-item"><span class="legend-dot route3"></span> 路线 3</div>
           <div class="legend-item"><span class="legend-dot route4"></span> 路线 4</div>
+          <div class="legend-item"><span class="legend-dot locked"></span> 锁定路线</div>
+          <div class="legend-item"><span class="legend-dot violation"></span> 违约节点</div>
+          <div class="legend-item"><span class="legend-dot coldchain"></span> 冷链订单</div>
         </div>
       </section>
     </aside>
