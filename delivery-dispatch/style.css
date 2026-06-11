@@ -850,3 +850,19 @@ html, body {
   .panel-left { width: 240px; min-width: 240px; }
   .panel-right { width: 320px; min-width: 320px; }
 }
+
+/* ===== Locked Route Order Items ===== */
+.locked-order {
+  opacity: 0.6 !important;
+  cursor: not-allowed !important;
+  pointer-events: none;
+}
+
+.route-card.locked .order-item {
+  cursor: not-allowed;
+  user-select: none;
+}
+
+.route-card.locked .order-item:hover {
+  background: transparent;
+}

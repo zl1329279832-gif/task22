@@ -257,49 +257,45 @@ function validateOrder(order, dpMap, whMap, vehicles) {
 // ========================
 
 function sortOrdersByObjective(orders, objective, dpMap, whMap) {
-  const sorted = [...orders];
+  // Split cold chain orders — they always get priority regardless of objective
+  const coldChainOrders = orders.filter(o => o.coldChain);
+  const normalOrders = orders.filter(o => !o.coldChain);
 
+  // Sort each group independently by objective
+  const sortFn = getObjectiveSortFn(objective);
+  coldChainOrders.sort(sortFn);
+  normalOrders.sort(sortFn);
+
+  // Cold chain always first
+  return coldChainOrders.concat(normalOrders);
+}
+
+// Returns the comparison function for a given objective
+function getObjectiveSortFn(objective) {
   switch (objective) {
     case 'shortest_distance':
-      // Sort by priority first; distance handled during scoring
-      sorted.sort((a, b) => a.priority - b.priority || a.timeWindowEnd - b.timeWindowEnd);
-      break;
+      return (a, b) => a.priority - b.priority || a.timeWindowEnd - b.timeWindowEnd;
 
     case 'least_overtime':
-      // Earliest deadline first to reduce violations
-      sorted.sort((a, b) => a.timeWindowEnd - b.timeWindowEnd || a.priority - b.priority);
-      break;
+      return (a, b) => a.timeWindowEnd - b.timeWindowEnd || a.priority - b.priority;
 
     case 'load_balance':
-      // Heaviest first — fill vehicles evenly
-      sorted.sort((a, b) => b.weight - a.weight || a.priority - b.priority);
-      break;
+      return (a, b) => b.weight - a.weight || a.priority - b.priority;
 
     case 'driver_fairness':
-      // Priority first; fairness handled during scoring
-      sorted.sort((a, b) => a.priority - b.priority || a.timeWindowEnd - b.timeWindowEnd);
-      break;
+      return (a, b) => a.priority - b.priority || a.timeWindowEnd - b.timeWindowEnd;
 
     case 'cold_chain_priority':
-      // Cold chain orders first, then by deadline
-      sorted.sort((a, b) => {
-        if (a.coldChain && !b.coldChain) return -1;
-        if (!a.coldChain && b.coldChain) return 1;
-        return a.timeWindowEnd - b.timeWindowEnd || a.priority - b.priority;
-      });
-      break;
+      // Within cold chain or normal group, sort by deadline
+      return (a, b) => a.timeWindowEnd - b.timeWindowEnd || a.priority - b.priority;
 
     default:
-      // Fallback: balanced urgency
-      sorted.sort((a, b) => {
+      return (a, b) => {
         const urgencyA = (a.timeWindowEnd - a.timeWindowStart) / a.priority;
         const urgencyB = (b.timeWindowEnd - b.timeWindowStart) / b.priority;
         return urgencyA - urgencyB;
-      });
-      break;
+      };
   }
-
-  return sorted;
 }
 
 // ========================
@@ -671,10 +667,13 @@ function finalizeRoute(route, dpMap, whMap, startTime) {
 
       // Record ETA
       const eta = Math.round(currentTime * 100) / 100;
-      route.stopETAs.push({ orderId: order.id, eta });
 
       if (currentTime < order.timeWindowStart) {
+        const stopWaitTime = Math.round((order.timeWindowStart - currentTime) * 60);
+        route.stopETAs.push({ orderId: order.id, eta, waitTime: stopWaitTime });
         currentTime = order.timeWindowStart; // Wait
+      } else {
+        route.stopETAs.push({ orderId: order.id, eta, waitTime: 0 });
       }
 
       if (currentTime > order.timeWindowEnd) {
@@ -686,9 +685,10 @@ function finalizeRoute(route, dpMap, whMap, startTime) {
           reason = '与前一站距离较远(' + Math.round(segDist) + ')，行驶耗时过长';
         } else if (i > 0 && route.stopETAs.length > 1) {
           const prevEta = route.stopETAs[route.stopETAs.length - 2].eta;
-          const waitTime = currentTime - travelTime - prevEta - 0.25;
-          if (waitTime > 0.5) {
-            reason = '前序站点等待时间窗开启耗时' + Math.round(waitTime * 60) + '分钟';
+          const prevWait = route.stopETAs[route.stopETAs.length - 2].waitTime || 0;
+          const gapTime = currentTime - travelTime - prevEta - 0.25;
+          if (gapTime > 0.5 || prevWait > 30) {
+            reason = '前序站点等待时间窗开启耗时' + Math.round((gapTime > 0 ? gapTime : 0) * 60) + '分钟';
           } else {
             reason = '前序站点服务耗时累积，到达时间推迟';
           }

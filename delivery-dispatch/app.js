@@ -43,6 +43,7 @@
     routeVersion: 0,
     computeRequestId: 0,
     pendingRecalcVersions: new Set(),
+    lastAppliedRecalcVersion: 0,
 
     // Animation state for violation pulse
     pulsePhase: 0,
@@ -198,11 +199,30 @@
       dom.vehicleCountLabel.textContent = this.value;
     });
 
-    // Vehicle count change — auto-recompute if routes exist and no locks
+    // Vehicle count change — smart handling with locked routes
     dom.vehicleCount.addEventListener('change', function() {
       if (state.routes.length > 0) {
+        const newCount = parseInt(this.value);
+
         if (state.lockedRoutes.size > 0) {
-          showToast('请先解锁所有路线后再调整车辆数', 'warning');
+          // Find the highest-indexed locked route
+          let maxLockedIndex = -1;
+          for (let i = 0; i < state.routes.length; i++) {
+            if (state.lockedRoutes.has(state.routes[i].id)) {
+              maxLockedIndex = i;
+            }
+          }
+          const minAllowed = maxLockedIndex + 1;
+
+          if (newCount < minAllowed) {
+            showToast('车辆数不能少于 ' + minAllowed + '（路线 ' + (maxLockedIndex + 1) + ' 已锁定）', 'warning');
+            this.value = minAllowed;
+            dom.vehicleCountLabel.textContent = minAllowed;
+            return;
+          }
+
+          // Allowed: use incremental compute to preserve locked routes
+          recalculateWithLocks();
         } else {
           startComputation();
         }
@@ -677,6 +697,7 @@
     state.routes = result.routes;
     state.unassigned = result.unassigned;
     state.stats = result.stats;
+    state.lastAppliedRecalcVersion = state.routeVersion;
 
     // Clear pending recalcs — they refer to pre-compute route state
     state.pendingRecalcVersions.clear();
@@ -701,12 +722,18 @@
     if (payload.routeVersion !== undefined && payload.routeVersion < state.routeVersion) {
       console.log('[Discarded] Stale RECALC_RESULT, version:', payload.routeVersion, 'current:', state.routeVersion);
       state.pendingRecalcVersions.delete(payload.routeVersion);
+      // If no newer recalc is pending, trigger a refinement to get authoritative data
+      if (state.pendingRecalcVersions.size === 0 && state.routes.length > 0) {
+        scheduleRefinementRecalc();
+      }
       return;
     }
 
     if (payload.batch && Array.isArray(payload.routes)) {
       // Batch result: apply all routes atomically
       for (const result of payload.routes) {
+        // Skip locked routes — never overwrite them from worker
+        if (state.lockedRoutes.has(result.id)) continue;
         const idx = state.routes.findIndex(r => r.id === result.id);
         if (idx >= 0) {
           state.routes[idx] = result;
@@ -714,14 +741,17 @@
       }
     } else {
       // Single route result (legacy)
-      const idx = state.routes.findIndex(r => r.id === payload.id);
-      if (idx >= 0) {
-        state.routes[idx] = payload;
+      if (!state.lockedRoutes.has(payload.id)) {
+        const idx = state.routes.findIndex(r => r.id === payload.id);
+        if (idx >= 0) {
+          state.routes[idx] = payload;
+        }
       }
     }
 
-    // Clean up pending tracking
+    // Track which version was last applied
     if (payload.routeVersion !== undefined) {
+      state.lastAppliedRecalcVersion = payload.routeVersion;
       state.pendingRecalcVersions.delete(payload.routeVersion);
     }
 
@@ -729,6 +759,7 @@
     recalcGlobalStats();
     updateStatsBar();
     renderRouteList();
+    renderUnassigned();
     renderCanvas();
   }
 
@@ -738,14 +769,37 @@
     if (payload.routeVersion !== undefined && payload.routeVersion < state.routeVersion) {
       console.log('[Discarded] Stale INCREMENTAL_RESULT, version:', payload.routeVersion, 'current:', state.routeVersion);
       state.pendingRecalcVersions.delete(payload.routeVersion);
+      // If no newer recalc is pending, trigger a refinement
+      if (state.pendingRecalcVersions.size === 0 && state.routes.length > 0) {
+        scheduleRefinementRecalc();
+      }
       return;
     }
 
-    state.routes = payload.routes;
-    state.unassigned = payload.unassigned;
-    state.stats = payload.stats;
+    // Apply incremental result, but preserve locked routes
+    if (payload.routes) {
+      // Build new routes array: use worker results, but keep locked routes as-is
+      const newRoutes = [];
+      for (const newRoute of payload.routes) {
+        if (state.lockedRoutes.has(newRoute.id)) {
+          // Keep the current locked route as-is from local state
+          const existing = state.routes.find(r => r.id === newRoute.id);
+          newRoutes.push(existing || newRoute);
+        } else {
+          newRoutes.push(newRoute);
+        }
+      }
+      state.routes = newRoutes;
+    }
+    if (payload.unassigned) {
+      state.unassigned = payload.unassigned;
+    }
+    if (payload.stats) {
+      state.stats = payload.stats;
+    }
 
     if (payload.routeVersion !== undefined) {
+      state.lastAppliedRecalcVersion = payload.routeVersion;
       state.pendingRecalcVersions.delete(payload.routeVersion);
     }
 
@@ -759,8 +813,8 @@
     dom.btnCompute.innerHTML = '&#9654; 开始调度计算';
     dom.btnExport.disabled = false;
 
-    dom.canvasInfo.textContent = '锁线重算完成 - ' + state.stats.activeRoutes + ' 条路线, ' +
-      state.stats.assignedOrders + ' 个订单已分配, ' + state.lockedRoutes.size + ' 条锁定';
+    dom.canvasInfo.textContent = '锁线重算完成 - ' + (state.stats ? state.stats.activeRoutes : 0) + ' 条路线, ' +
+      (state.stats ? state.stats.assignedOrders : 0) + ' 个订单已分配, ' + state.lockedRoutes.size + ' 条锁定';
     showToast('锁线重算完成', 'success');
     startPulseAnimation();
   }
@@ -781,6 +835,33 @@
     updateRecalcButtonVisibility();
     renderRouteList();
     renderCanvas();
+  }
+
+  // Trigger a refinement recalc when a stale worker result was discarded
+  // This ensures we always get authoritative data from the worker
+  function scheduleRefinementRecalc() {
+    if (!state.data || state.routes.length === 0) return;
+
+    const activeRoutes = state.routes.filter(r => r.orders.length > 0);
+    if (activeRoutes.length === 0) return;
+
+    const dpMap = buildDpMap();
+    const whMap = buildWhMap();
+    const startTime = parseInt(dom.startTime.value) || 8;
+
+    state.routeVersion++;
+    state.pendingRecalcVersions.add(state.routeVersion);
+
+    state.worker.postMessage({
+      type: 'RECALCULATE_ROUTES',
+      payload: {
+        routes: activeRoutes,
+        dpMap: dpMap,
+        whMap: whMap,
+        startTime: startTime,
+        routeVersion: state.routeVersion
+      }
+    });
   }
 
   function updateRecalcButtonVisibility() {
@@ -973,9 +1054,15 @@
       // Bind drag & drop to order items
       const orderItems = card.querySelectorAll('.order-item');
       orderItems.forEach(item => {
-        item.draggable = true;
-        item.addEventListener('dragstart', onOrderDragStart);
-        item.addEventListener('dragend', onOrderDragEnd);
+        if (isLocked) {
+          // Locked route: orders cannot be dragged
+          item.draggable = false;
+          item.classList.add('locked-order');
+        } else {
+          item.draggable = true;
+          item.addEventListener('dragstart', onOrderDragStart);
+          item.addEventListener('dragend', onOrderDragEnd);
+        }
       });
 
       const orderList = card.querySelector('.order-list');
@@ -1011,6 +1098,17 @@
   function onOrderDragStart(e) {
     const orderId = e.target.dataset.orderId;
     const routeIndex = parseInt(e.target.dataset.routeIndex);
+
+    // Block drag from locked routes
+    if (!isNaN(routeIndex) && state.routes[routeIndex]) {
+      const route = state.routes[routeIndex];
+      if (state.lockedRoutes.has(route.id)) {
+        e.preventDefault();
+        showToast('路线已锁定，无法拖拽订单', 'warning');
+        return;
+      }
+    }
+
     state.dragOrder = orderId;
     state.dragSourceRoute = routeIndex;
     e.target.classList.add('dragging');
@@ -1045,6 +1143,18 @@
 
     if (orderId == null) return;
 
+    // Block drop on locked target route
+    if (state.routes[targetRouteIndex] && state.lockedRoutes.has(state.routes[targetRouteIndex].id)) {
+      showToast('目标路线已锁定，无法拖入订单', 'warning');
+      return;
+    }
+
+    // Block drop if source is locked (defense in depth)
+    if (sourceRouteIndex !== null && state.routes[sourceRouteIndex] && state.lockedRoutes.has(state.routes[sourceRouteIndex].id)) {
+      showToast('源路线已锁定，无法移出订单', 'warning');
+      return;
+    }
+
     if (sourceRouteIndex === null) {
       // Dragging from unassigned pool
       assignUnassignedToRoute(orderId, targetRouteIndex);
@@ -1058,6 +1168,16 @@
     const fromRoute = state.routes[fromIndex];
     const toRoute = state.routes[toIndex];
     if (!fromRoute || !toRoute) return;
+
+    // Defense-in-depth: block if either route is locked
+    if (state.lockedRoutes.has(fromRoute.id)) {
+      showToast('源路线 ' + (fromIndex + 1) + ' 已锁定，无法移出订单', 'warning');
+      return;
+    }
+    if (state.lockedRoutes.has(toRoute.id)) {
+      showToast('目标路线 ' + (toIndex + 1) + ' 已锁定，无法移入订单', 'warning');
+      return;
+    }
 
     const orderIdx = fromRoute.orders.findIndex(o => o.id === orderId);
     if (orderIdx < 0) return;
@@ -1145,6 +1265,12 @@
   function assignUnassignedToRoute(orderId, targetRouteIndex) {
     const toRoute = state.routes[targetRouteIndex];
     if (!toRoute) return;
+
+    // Defense-in-depth: block if target route is locked
+    if (state.lockedRoutes.has(toRoute.id)) {
+      showToast('目标路线 ' + (targetRouteIndex + 1) + ' 已锁定，无法拖入订单', 'warning');
+      return;
+    }
 
     // Find the order in unassigned
     const unassignedIdx = state.unassigned.findIndex(u => u.order.id === orderId);
@@ -1287,21 +1413,34 @@
 
         // Record ETA
         const eta = Math.round(currentTime * 100) / 100;
-        route.stopETAs.push({ orderId: order.id, eta });
 
         if (currentTime < order.timeWindowStart) {
+          // Track wait time for time window alignment
+          const waitTime = Math.round((order.timeWindowStart - currentTime) * 60);
+          route.stopETAs.push({ orderId: order.id, eta, waitTime });
           currentTime = order.timeWindowStart; // Wait until window opens
+        } else {
+          route.stopETAs.push({ orderId: order.id, eta, waitTime: 0 });
         }
 
         if (currentTime > order.timeWindowEnd) {
-          // Determine violation reason
+          // Determine violation reason (aligned with worker's finalizeRoute)
           let reason = '';
           if (route.driver && route.estimatedTime > route.driver.maxHours) {
             reason = '司机工时超限导致整体延误';
           } else if (segDist > 100) {
             reason = '与前一站距离较远(' + Math.round(segDist) + ')，行驶耗时过长';
+          } else if (i > 0 && route.stopETAs.length > 1) {
+            const prevEta = route.stopETAs[route.stopETAs.length - 2].eta;
+            const prevWait = route.stopETAs[route.stopETAs.length - 2].waitTime || 0;
+            const gapTime = currentTime - travelTime - prevEta - 0.25;
+            if (gapTime > 0.5 || prevWait > 30) {
+              reason = '前序站点等待时间窗开启耗时' + Math.round((gapTime > 0 ? gapTime : 0) * 60) + '分钟';
+            } else {
+              reason = '前序站点服务耗时累积，到达时间推迟';
+            }
           } else {
-            reason = '前序站点服务耗时累积，到达时间推迟';
+            reason = '前序站点服务耗时累积';
           }
 
           route.timeWindowViolations.push({
@@ -1453,6 +1592,49 @@
       return;
     }
 
+    // Block export if worker computation is pending
+    if (state.pendingRecalcVersions.size > 0) {
+      showToast('Worker 正在计算中，请等待完成后再导出', 'warning');
+      return;
+    }
+
+    // Consistency verification
+    const issues = [];
+    const allOrderIds = new Set();
+    const dpMap = buildDpMap();
+
+    for (let i = 0; i < state.routes.length; i++) {
+      const route = state.routes[i];
+      if (route.orders.length === 0) continue;
+
+      // Weight sum check
+      let weightSum = 0;
+      for (const order of route.orders) {
+        weightSum += order.weight;
+      }
+      if (Math.abs(weightSum - (route.totalWeight || 0)) > 1) {
+        issues.push('路线 ' + (i + 1) + ': 订单重量之和(' + weightSum + 'kg) 与 totalWeight(' + (route.totalWeight || 0) + 'kg) 不一致');
+      }
+
+      // Capacity check
+      if (route.vehicle && weightSum > route.vehicle.capacity) {
+        issues.push('路线 ' + (i + 1) + ': 超载! ' + weightSum + 'kg > ' + route.vehicle.capacity + 'kg');
+      }
+
+      // Duplicate order check
+      for (const order of route.orders) {
+        if (allOrderIds.has(order.id)) {
+          issues.push('订单 ' + order.id + ' 在多条路线中重复出现');
+        }
+        allOrderIds.add(order.id);
+      }
+    }
+
+    // Show warnings but allow export
+    if (issues.length > 0) {
+      showToast('导出一致性检查发现 ' + issues.length + ' 个问题: ' + issues[0] + (issues.length > 1 ? ' ...' : ''), 'warning');
+    }
+
     const plan = {
       exportTime: new Date().toISOString(),
       parameters: {
@@ -1463,6 +1645,9 @@
       },
       lockedRouteIds: Array.from(state.lockedRoutes),
       routeVersion: state.routeVersion,
+      computeRequestId: state.computeRequestId,
+      consistencyVerified: issues.length === 0,
+      consistencyIssues: issues,
       stats: state.stats,
       routes: state.routes.map((r, i) => ({
         routeIndex: i + 1,
@@ -1478,6 +1663,8 @@
         overtimeRisk: r.overtimeRisk,
         overtimeMinutes: r.overtimeMinutes,
         timeWindowViolations: r.timeWindowViolations,
+        stopETAs: r.stopETAs,
+        constraintWarnings: r.constraintWarnings,
         groupingReasons: r.groupingReason
       })),
       unassigned: state.unassigned
@@ -1491,7 +1678,7 @@
     a.click();
     URL.revokeObjectURL(url);
 
-    showToast('调度方案已导出', 'success');
+    showToast('调度方案已导出' + (issues.length === 0 ? ' (一致性验证通过)' : ' (存在一致性问题)'), issues.length === 0 ? 'success' : 'warning');
   }
 
   // ===== Save / Load (localStorage) =====
