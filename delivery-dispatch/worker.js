@@ -657,6 +657,7 @@ function finalizeRoute(route, dpMap, whMap, startTime) {
   // Time window violations with ETA and reasons
   route.timeWindowViolations = [];
   route.stopETAs = [];
+  route.constraintWarnings = [];
   const routeStartTime = startTime || 8;
   let currentTime = routeStartTime;
   currentPoint = warehouse;
@@ -709,6 +710,23 @@ function finalizeRoute(route, dpMap, whMap, startTime) {
       currentPoint = dp;
     }
   }
+
+  // Constraint warnings
+  if (route.totalWeight > route.vehicle.capacity) {
+    route.constraintWarnings.push('超载: ' + route.totalWeight + 'kg > ' + route.vehicle.capacity + 'kg');
+  }
+  if (route.overtimeRisk === 'high') {
+    route.constraintWarnings.push('超时高风险: ' + route.estimatedTime + 'h > ' + (route.driver ? route.driver.maxHours : 'N/A') + 'h');
+  }
+  if (route.timeWindowViolations.length > 0) {
+    route.constraintWarnings.push('时间窗违规: ' + route.timeWindowViolations.length + ' 个订单');
+  }
+  // Cold chain mixing warning
+  var ccOrders = route.orders.filter(function(o) { return o.coldChain; });
+  var nccOrders = route.orders.filter(function(o) { return !o.coldChain; });
+  if (ccOrders.length > 0 && nccOrders.length > 0) {
+    route.constraintWarnings.push('冷链混装: ' + ccOrders.length + ' 个冷链 + ' + nccOrders.length + ' 个非冷链');
+  }
 }
 
 function recalculateSingleRoute({ route, dpMap, whMap, startTime }) {
@@ -729,6 +747,13 @@ function recalculateSingleRoute({ route, dpMap, whMap, startTime }) {
   const constraintWarnings = [];
   if (recalculated.totalWeight > route.vehicle.capacity) {
     constraintWarnings.push('超载: 总重 ' + recalculated.totalWeight + 'kg 超过车辆容量 ' + route.vehicle.capacity + 'kg');
+  }
+
+  // Cold chain constraint: warn if mixing cold chain and non-cold-chain orders
+  const coldChainOrders = route.orders.filter(o => o.coldChain);
+  const nonColdChainOrders = route.orders.filter(o => !o.coldChain);
+  if (coldChainOrders.length > 0 && nonColdChainOrders.length > 0) {
+    constraintWarnings.push('冷链混装: 路线中包含 ' + coldChainOrders.length + ' 个冷链订单和 ' + nonColdChainOrders.length + ' 个非冷链订单，建议分开配送');
   }
 
   finalizeRoute(recalculated, dpMap, whMap, startTime);
